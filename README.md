@@ -27,10 +27,11 @@ Embedding
 
 ## 启动网页
 
-Python 3.10 及以上：
+Python 3.10 及以上，无第三方依赖：
 
 ```powershell
-cd E:\Project\transformer_modeling
+git clone https://github.com/Sereinthur/Transformer-modeling.git
+cd Transformer-modeling
 python web_app.py
 ```
 
@@ -42,16 +43,16 @@ python web_app.py --no-browser
 
 手动模式模型页包含循环 Pattern 编辑器。每一行都可以设置重复次数，并独立选择 Norm、Attention、Residual 和 FFN 算子；KDA、MLA、AttnRes、MoE 与 MXFP 参数是通用算子参数，不依赖 Kimi K3 预设。
 
-示例中的效率系数采用《LLM推理显存与性能实测校准数据》约束下的保守经验初值。公开资料提供的是端到端吞吐、TTFT、TPOT和容量分解，不能唯一反解单个算子的效率，因此这些数值不是实测真值：Dense示例使用`0.65/0.20`的Prefill/Decode GEMM效率、`0.50/0.15`的Attention效率、`0.15`的向量效率和`0.75`的HBM效率；MoE与KDA/MLA示例使用更保守的初值。用户应按硬件、框架、精度和Shape继续调整。
+示例中的效率系数是依据公开评测资料约束校准的保守经验初值。公开资料提供的是端到端吞吐、TTFT、TPOT和容量分解，不能唯一反解单个算子的效率，因此这些数值不是实测真值：Dense示例使用`0.65/0.20`的Prefill/Decode GEMM效率、`0.50/0.15`的Attention效率、`0.15`的向量效率和`0.75`的HBM效率；MoE与KDA/MLA示例使用更保守的初值。用户应按硬件、框架、精度和Shape继续调整。
 
 ## 命令行与 Python API
 
 ```powershell
-python -m transformer_modeling examples\single_chip_gqa.json -o result.json
-python -m transformer_modeling examples\tp4_gqa.json -o tp4_result.json
-python -m transformer_modeling examples\pp4_gqa.json -o pp4_result.json
-python -m transformer_modeling examples\moe_qwen3_30b_a3b.json -o moe_result.json
-python -m transformer_modeling examples\kimi_k3_base_tp64.json -o kimi_k3_result.json
+python -m transformer_modeling examples/single_chip_gqa.json -o result.json
+python -m transformer_modeling examples/tp4_gqa.json -o tp4_result.json
+python -m transformer_modeling examples/pp4_gqa.json -o pp4_result.json
+python -m transformer_modeling examples/moe_qwen3_30b_a3b.json -o moe_result.json
+python -m transformer_modeling examples/kimi_k3_base_tp64.json -o kimi_k3_result.json
 ```
 
 稳定的顶层调用入口：
