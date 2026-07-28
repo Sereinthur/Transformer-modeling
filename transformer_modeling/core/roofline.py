@@ -67,8 +67,8 @@ class OperatorCostModel:
     #        memory_time  = HBM字节数 ÷ 有效带宽
     #        launch_time  = kernel数 × 每次启动延迟
     #     3. 有界重叠模型：
-    #        lower = max(compute, memory) + launch   ← 完全不重叠
-    #        upper = compute + memory + launch       ← 完全重叠
+    #        lower = max(compute, memory) + launch   ← 完全重叠
+    #        upper = compute + memory + launch       ← 完全不重叠
     #        final = lower + overlap_rho × (upper - lower)  ← 插值
     # ─────────────────────────────────────────────────────────────────────
     def estimate(self, item: WorkItem, phase: str) -> dict[str, Any]:

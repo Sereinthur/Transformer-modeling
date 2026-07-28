@@ -159,14 +159,14 @@
       }
     },
     "extra": {
-      "parameter_count": 28911125504,
+      "parameter_count": 8911125504,
       "sharding": "tp_ep"
     },
     "metadata": {
       "family": "Kimi K3 Hybrid MoE",
       "scenario": "official_config_aligned",
       "mapping_quality": "official_config_with_equivalent_width",
-      "parameter_target": 2800000000000,
+      "parameter_target": 2780000000000,
       "config_source": "moonshotai/Kimi-K3 config.json (2026-07-27)",
       "layer_order_note": "官方layer_types为3:1交错（full_attn_layers=[4,8,...,92,93]），本pattern按分组展开（68×KDA后接24×MLA），TP-only聚合结果等价，PP stage均衡性有偏差",
       "unsupported_features": [
