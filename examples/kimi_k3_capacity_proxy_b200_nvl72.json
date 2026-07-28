@@ -1,0 +1,226 @@
+{
+  "_说明": "Kimi K3容量代理（官方config对齐版，2026-07-27开源权重）。1M prompt容量场景，仅int4吞吐→容量-only。93层=1×(KDA+dense)+68×(KDA+MoE)+24×(MLA+MoE)，96头，TP=8×PP=9=72设备。MoE按LatentMoE真值建模：latent_size=3584，expert=3072，shared=6144（=2个shared expert）。",
+  "schema_version": 2,
+  "hardware": {
+    "name": "B200_192GiB_NVL72_capacity_proxy",
+    "device_count": 72,
+    "compute": {
+      "throughput": {
+        "int4_dense_ops_per_second": 9000000000000000
+      },
+      "matrix_tile": {
+        "m": 16,
+        "n": 16,
+        "k": 32
+      }
+    },
+    "device_memory": {
+      "type": "HBM3e",
+      "capacity_bytes": 206158430208,
+      "peak_bandwidth_bytes_per_second": 8000000000000,
+      "reserved_capacity_bytes": 21474836480
+    },
+    "runtime": {
+      "kernel_launch_latency_seconds": 5e-06
+    },
+    "interconnect": {
+      "topology": "ring",
+      "effective_channel_bandwidth_bytes_per_second": 900000000000,
+      "collective_step_latency_seconds": 2e-06,
+      "pipeline_effective_bandwidth_bytes_per_second": 200000000000,
+      "pipeline_transfer_latency_seconds": 5e-06
+    }
+  },
+  "model": {
+    "id": "kimi-k3-official",
+    "name": "Kimi K3（官方config对齐·等效宽度）",
+    "dimensions": {
+      "layer_count": 93,
+      "hidden_size": 7168,
+      "intermediate_size": 33792,
+      "vocab_size": 163840,
+      "padded_vocab_size": 163840
+    },
+    "dtype": {
+      "weight": "mxfp4",
+      "activation": "mxfp8",
+      "kv_cache": "mxfp8",
+      "state": "mxfp8",
+      "accumulation": "bf16",
+      "logits": "fp32"
+    },
+    "inference": {
+      "prefill_logits_mode": "last_token"
+    },
+    "quantization": {
+      "block_size": 32,
+      "scale_bytes": 1
+    },
+    "embedding": {
+      "type": "token_embedding",
+      "tied_lm_head": false
+    },
+    "layer_pattern": [
+      {
+        "repeat": 1,
+        "norm": {
+          "type": "rms_norm"
+        },
+        "attention": {
+          "type": "kda",
+          "implementation": "chunkwise",
+          "heads": 96,
+          "key_dim": 128,
+          "value_dim": 128,
+          "short_conv_kernel_size": 4,
+          "chunk_size": 256
+        },
+        "residual": {
+          "type": "attnres",
+          "block_count": 8
+        },
+        "ffn": {
+          "type": "gated_ffn",
+          "implementation": "swiglu",
+          "intermediate_size": 33792
+        }
+      },
+      {
+        "repeat": 68,
+        "norm": {
+          "type": "rms_norm"
+        },
+        "attention": {
+          "type": "kda",
+          "implementation": "chunkwise",
+          "heads": 96,
+          "key_dim": 128,
+          "value_dim": 128,
+          "short_conv_kernel_size": 4,
+          "chunk_size": 256
+        },
+        "residual": {
+          "type": "attnres",
+          "block_count": 8
+        },
+        "ffn": {
+          "type": "moe",
+          "implementation": "latent_moe_approx",
+          "expert_count": 896,
+          "experts_per_token": 16,
+          "expert_intermediate_size": 3072,
+          "shared_expert_intermediate_size": 6144,
+          "activation": "swiglu",
+          "situ_ops_per_element": 6,
+          "latent_size": 3584
+        }
+      },
+      {
+        "repeat": 24,
+        "norm": {
+          "type": "rms_norm"
+        },
+        "attention": {
+          "type": "gated_mla",
+          "implementation": "latent_cache",
+          "query_heads": 96,
+          "q_lora_rank": 1536,
+          "kv_lora_rank": 512,
+          "qk_nope_head_dim": 128,
+          "qk_rope_head_dim": 64,
+          "v_head_dim": 128
+        },
+        "residual": {
+          "type": "attnres",
+          "block_count": 8
+        },
+        "ffn": {
+          "type": "moe",
+          "implementation": "latent_moe_approx",
+          "expert_count": 896,
+          "experts_per_token": 16,
+          "expert_intermediate_size": 3072,
+          "shared_expert_intermediate_size": 6144,
+          "activation": "swiglu",
+          "situ_ops_per_element": 6,
+          "latent_size": 3584
+        }
+      }
+    ],
+    "output": {
+      "norm": {
+        "type": "rms_norm"
+      },
+      "head": {
+        "type": "lm_head"
+      },
+      "sampling": {
+        "type": "sampling"
+      }
+    },
+    "extra": {
+      "parameter_count": 28911125504,
+      "sharding": "tp_ep"
+    },
+    "metadata": {
+      "family": "Kimi K3 Hybrid MoE",
+      "scenario": "official_config_aligned",
+      "mapping_quality": "official_config_with_equivalent_width",
+      "parameter_target": 2800000000000,
+      "config_source": "moonshotai/Kimi-K3 config.json (2026-07-27)",
+      "layer_order_note": "官方layer_types为3:1交错（full_attn_layers=[4,8,...,92,93]），本pattern按分组展开（68×KDA后接24×MLA），TP-only聚合结果等价，PP stage均衡性有偏差",
+      "unsupported_features": [
+        "SiTU-GLU精确方程（beta=4.0/25.0）",
+        "MoonViT-V2视觉前端",
+        "DSpark投机解码"
+      ],
+      "moe_mapping": "latent_size=3584显式建模共享下/上投影，专家GEMM与EP通信均在latent域"
+    }
+  },
+  "serving": {
+    "batch_size": 1,
+    "prompt_length": {
+      "distribution": "fixed",
+      "value": 1048576
+    },
+    "output_length": {
+      "distribution": "fixed",
+      "value": 1
+    },
+    "max_sequence_length": 1048576
+  },
+  "execution": {
+    "fusion": {
+      "flash_attention": true,
+      "rope_kv_write": true,
+      "gated_mlp": true,
+      "rmsnorm_linear": true
+    },
+    "overlap": {
+      "mode": "bounded_interpolation",
+      "interpolation_rho": 0.15,
+      "prefill_tp_interpolation_rho": 0.65,
+      "decode_tp_interpolation_rho": 1.0
+    },
+    "efficiencies": {
+      "_说明": "参考KDA/MLA相对结果和MLA+MoE服务数据采用的低置信度经验初值，并非Kimi K3实测。",
+      "prefill_gemm": 0.55,
+      "decode_gemm": 0.12,
+      "prefill_attention": 0.35,
+      "decode_attention": 0.1,
+      "vector": 0.12,
+      "hbm": 0.7
+    },
+    "memory": {
+      "kv_paged": true,
+      "kv_page_tokens": 16
+    }
+  },
+  "parallelism": {
+    "tensor_parallel": 8,
+    "pipeline_parallel": 9,
+    "pipeline_microbatches": 1,
+    "kv_head_policy": "shard_or_group_replicate",
+    "expert_parallel": 1
+  }
+}

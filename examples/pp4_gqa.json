@@ -1,0 +1,151 @@
+{
+  "_说明": "4 Stage Pipeline Parallel GQA示例；每个Stage使用1个rank，Batch 4拆成4个microbatch。",
+  "schema_version": 2,
+  "hardware": {
+    "name": "example_4stage_100t_80g",
+    "device_count": 4,
+    "compute": {
+      "throughput": {
+        "fp16_dense_ops_per_second": 100000000000000
+      },
+      "matrix_tile": {
+        "m": 16,
+        "n": 16,
+        "k": 16
+      }
+    },
+    "device_memory": {
+      "type": "HBM",
+      "capacity_bytes": 85899345920,
+      "peak_bandwidth_bytes_per_second": 2000000000000,
+      "reserved_capacity_bytes": 1073741824
+    },
+    "runtime": {
+      "kernel_launch_latency_seconds": 5e-06
+    },
+    "interconnect": {
+      "topology": "ring",
+      "effective_channel_bandwidth_bytes_per_second": 100000000000,
+      "collective_step_latency_seconds": 2e-06,
+      "pipeline_effective_bandwidth_bytes_per_second": 100000000000,
+      "pipeline_transfer_latency_seconds": 2e-06
+    }
+  },
+  "model": {
+    "id": "decoder_only",
+    "name": "decoder_only",
+    "dimensions": {
+      "layer_count": 32,
+      "hidden_size": 4096,
+      "intermediate_size": 11008,
+      "vocab_size": 32000,
+      "padded_vocab_size": 32000
+    },
+    "embedding": {
+      "type": "token_embedding",
+      "tied_lm_head": true
+    },
+    "layer_pattern": [
+      {
+        "repeat": 1,
+        "norm": {
+          "type": "rms_norm"
+        },
+        "attention": {
+          "type": "standard_attention",
+          "implementation": "flash_attention",
+          "query_heads": 32,
+          "kv_heads": 8,
+          "head_dim": 128,
+          "query_width_equals_hidden": true
+        },
+        "residual": {
+          "type": "standard_residual"
+        },
+        "ffn": {
+          "type": "gated_ffn",
+          "implementation": "swiglu",
+          "intermediate_size": 11008
+        }
+      }
+    ],
+    "output": {
+      "norm": {
+        "type": "rms_norm"
+      },
+      "head": {
+        "type": "lm_head"
+      },
+      "sampling": {
+        "type": "sampling"
+      }
+    },
+    "dtype": {
+      "weight": "fp16",
+      "activation": "fp16",
+      "kv_cache": "fp16",
+      "state": "fp16",
+      "accumulation": "fp32",
+      "logits": "fp32"
+    },
+    "inference": {
+      "prefill_logits_mode": "last_token"
+    },
+    "quantization": {
+      "block_size": 32,
+      "scale_bytes": 1
+    },
+    "metadata": {
+      "family": "decoder_only",
+      "mapping_quality": "migrated_example",
+      "unsupported_features": []
+    }
+  },
+  "serving": {
+    "batch_size": 4,
+    "prompt_length": {
+      "distribution": "fixed",
+      "value": 2048
+    },
+    "output_length": {
+      "distribution": "fixed",
+      "value": 128
+    },
+    "max_sequence_length": 4096
+  },
+  "execution": {
+    "fusion": {
+      "flash_attention": true,
+      "rope_kv_write": true,
+      "gated_mlp": true,
+      "rmsnorm_linear": true
+    },
+    "overlap": {
+      "mode": "bounded_interpolation",
+      "interpolation_rho": 0.1,
+      "tp_interpolation_rho": 1.0,
+      "prefill_tp_interpolation_rho": 0.5,
+      "decode_tp_interpolation_rho": 1.0
+    },
+    "efficiencies": {
+      "_说明": "公开端到端实测约束下的Dense经验初值，不是理论常数或单算子直接实测值。",
+      "prefill_gemm": 0.65,
+      "decode_gemm": 0.2,
+      "prefill_attention": 0.5,
+      "decode_attention": 0.15,
+      "vector": 0.15,
+      "hbm": 0.75
+    },
+    "memory": {
+      "kv_paged": true,
+      "kv_page_tokens": 16
+    }
+  },
+  "parallelism": {
+    "tensor_parallel": 1,
+    "pipeline_parallel": 4,
+    "pipeline_microbatches": 4,
+    "kv_head_policy": "shard_or_group_replicate",
+    "expert_parallel": 1
+  }
+}

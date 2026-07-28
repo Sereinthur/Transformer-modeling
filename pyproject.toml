@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "transformer-modeling"
+version = "0.6.0"
+description = "Replaceable-operator analytical model for TP, EP, and PP Transformer inference"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Transformer Modeling Project"}]
+dependencies = []
+
+[project.scripts]
+transformer-model = "transformer_modeling.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["transformer_modeling*"]
