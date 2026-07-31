@@ -101,16 +101,25 @@ export function renderPipeline(prefill, pp) {
 function renderHybrid(result) {
   const block = $("#hybrid-result-block");
   const mix = result.model.operator_mix || {};
-  const hybrid = Boolean(mix.kda || mix.gated_mla || mix.attnres);
+  const hybrid = Boolean(mix.kda || mix.gated_mla || mix.attnres || mix.csa_attention || mix.hca_attention || mix.mhc);
   block.hidden = !hybrid;
   if (!hybrid) return;
-  $("#hybrid-result-summary").textContent = `${mix.kda || 0}层 KDA · ${mix.gated_mla || 0}层 Gated MLA · ${mix.attnres || 0}次 AttnRes`;
+  $("#hybrid-result-summary").textContent = [
+    `${mix.kda || 0}层 KDA`, `${mix.gated_mla || 0}层 Gated MLA`,
+    `${mix.csa_attention || 0}层 CSA`, `${mix.hca_attention || 0}层 HCA`,
+    `${mix.attnres || 0}次 AttnRes`, `${mix.mhc || 0}次 mHC`,
+  ].join(" · ");
   const critical = criticalCapacity(result.capacity);
   const states = critical.states_by_operator || {};
+  const byDtype = critical.weights_by_dtype || {};
   const rows = [
     ["每rank权重", formatBytes(critical.weights_bytes)],
+    ["权重精度分布", Object.entries(byDtype).map(([dtype, value]) => `${dtype.toUpperCase()} ${formatBytes(value)}`).join(" + ") || "单一精度"],
     ["KDA State", formatBytes(states.kda_state_bytes || 0)],
     ["MLA Latent KV", formatBytes(states.mla_latent_kv_cache_bytes || 0)],
+    ["压缩 KV Cache", formatBytes(states.compressed_kv_cache_bytes || 0)],
+    ["滑窗 KV Cache", formatBytes(states.sliding_window_kv_cache_bytes || 0)],
+    ["Indexer Key Cache", formatBytes(states.indexer_key_cache_bytes || 0)],
     ["AttnRes State", formatBytes(states.attnres_state_bytes || 0)],
     ["未建模参数", formatParameters(critical.weights_by_operator.unmodeled_parameters || 0)],
     ["性能完整性", result.validity.performance_complete ? "完整" : "已建模代理结果"],

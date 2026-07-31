@@ -50,9 +50,15 @@ class NormOperator(TransformerOperator):
         h, rows, count = ctx.model.hidden_size, ctx.rows, ctx.occurrence_count
         ba = effective_element_bytes(ctx.config, ctx.model.activation_dtype)
         ops_per = 5 if self.type_id == "rms_norm" else 8
+        # RMSNorm与后续线性层融合时，归一化结果不写回HBM（统计pass只读一次）。
+        fused = (
+            self.type_id == "rms_norm"
+            and ctx.config.execution.rmsnorm_linear_fused
+        )
+        traffic_factor = 1 if fused else 2
         item = WorkItem(
             f"layers.{self.type_id}", "vector", ops_per * rows * h * count,
-            2 * rows * h * ba * count, count,
+            traffic_factor * rows * h * ba * count, count,
         )
         return OperatorEstimate(
             self.type_id, self.chinese_name, count, h * count, h * count,
@@ -123,6 +129,46 @@ class AttnResOperator(TransformerOperator):
                 "Block AttnRes在Attention/FFN前构造输入。",
                 "block representation属于单次前向临时空间，不作为跨token持久状态。",
                 "工作量按平均可见block数、流量按two-phase 5.5d/子层近似。",
+            ], confidence="low",
+        )
+
+
+class MHCOperator(TransformerOperator):
+    """mHC：n通道流形约束超连接，B*经Sinkhorn归一化后做通道混合。"""
+
+    type_id, chinese_name, slot = "mhc", "mHC流形约束超连接", "residual"
+
+    def validate(self, spec, config):
+        super().validate(spec, config)
+        if int(spec.get("channels", 4)) <= 0:
+            raise ValueError("mhc.channels must be greater than zero")
+        if int(spec.get("sinkhorn_iters", 20)) < 0:
+            raise ValueError("mhc.sinkhorn_iters cannot be negative")
+
+    def estimate(self, spec, ctx):
+        channels = int(spec.get("channels", 4))
+        iters = int(spec.get("sinkhorn_iters", 20))
+        h, rows, count = ctx.model.hidden_size, ctx.rows, ctx.occurrence_count
+        ba = effective_element_bytes(ctx.config, ctx.model.activation_dtype)
+        # B*·X通道混合 + A·X归并 + C广播回写，Sinkhorn迭代只作用于n×n矩阵。
+        ops = (
+            2 * rows * h * channels * channels
+            + 4 * rows * h * channels
+            + 4 * channels * channels * iters
+        ) * count
+        traffic = (2 * channels + 1) * rows * h * ba * count
+        parameters = 3 * channels * channels * count
+        return OperatorEstimate(
+            self.type_id, self.chinese_name, count,
+            global_parameters=parameters,
+            local_parameters=parameters,
+            parameter_breakdown={"mhc_parameters": parameters},
+            temporary_bytes=ceil(rows * h * channels * ba),
+            work_items=[WorkItem("layers.mhc", "vector", ops, traffic, count, ops)],
+            assumptions=[
+                f"Sinkhorn {iters}次迭代融入残差混合kernel，不单独启动。",
+                "mHC中间激活按重计算处理，不作为持久状态缓存。",
+                f"{channels}通道残差流按峰值临时空间计入容量。",
             ], confidence="low",
         )
 

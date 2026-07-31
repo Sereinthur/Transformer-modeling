@@ -19,7 +19,11 @@ def pipeline_schedule(
     stage_send_seconds: list[float],
     microbatches: int,
 ) -> dict[str, Any]:
-    """用flow-shop递推计算前向流水的填充、稳态和排空时间。"""
+    """用flow-shop递推计算前向流水的填充、稳态和排空时间。
+
+    Stage占用只包含本地计算；发送只推迟下游的就绪时间，
+    可与本Stage下一个microbatch的计算重叠（发送占用互联而非算力）。
+    """
 
     stage_count = len(stage_compute_seconds)
     if len(stage_send_seconds) != stage_count:
@@ -32,18 +36,29 @@ def pipeline_schedule(
     ]
     for microbatch in range(microbatches):
         for stage in range(stage_count):
-            upstream_ready = finishes[stage - 1][microbatch] if stage else 0.0
+            upstream_ready = (
+                finishes[stage - 1][microbatch] + stage_send_seconds[stage - 1]
+                if stage else 0.0
+            )
             stage_ready = finishes[stage][microbatch - 1] if microbatch else 0.0
             starts[stage][microbatch] = max(upstream_ready, stage_ready)
-            finishes[stage][microbatch] = starts[stage][microbatch] + services[stage]
+            finishes[stage][microbatch] = (
+                starts[stage][microbatch] + stage_compute_seconds[stage]
+            )
 
-    makespan = finishes[-1][-1]
-    busy_slot_seconds = microbatches * sum(services) #所有stage实际工作总时间
+    makespan = finishes[-1][-1] + stage_send_seconds[-1]
+    round_trip = finishes[-1][0] + stage_send_seconds[-1]  # 单个microbatch的全程延迟
+    busy_slot_seconds = microbatches * sum(stage_compute_seconds) #所有stage实际工作总时间
     available_slot_seconds = stage_count * makespan #所有stage可用总时间
     idle_slot_seconds = max(0.0, available_slot_seconds - busy_slot_seconds) #所有stage空闲总时间
+    # 稳态每轮间隔：瓶颈资源（最慢stage算力或最慢链路）的占用 × microbatch数，
+    # 且不低于单个microbatch的流水全程；用于token间可流水的稳态吞吐口径。
+    cycle = max(max(stage_compute_seconds), max(stage_send_seconds))
+    steady_interval = max(microbatches * cycle, round_trip)
     return {
         "makespan_seconds": makespan,
-        "first_microbatch_latency_seconds": finishes[-1][0],
+        "first_microbatch_latency_seconds": round_trip,
+        "steady_state_interval_seconds": steady_interval,
         "stage_service_seconds": services,
         "critical_stage_index": max(range(stage_count), key=services.__getitem__),
         "average_stage_utilization": (

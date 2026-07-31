@@ -13,15 +13,17 @@ Embedding
 ## 功能范围
 
 - Schema v2 固定骨架与可循环的 `layer_pattern`。
-- Attention：标准 MHA/GQA/MQA、Flash Attention、KDA、Gated MLA。
-- FFN：Dense、Gated/SwiGLU、普通 MoE、LatentMoE 近似。
+- Attention：标准 MHA/GQA/MQA、Flash Attention、KDA、Gated MLA，标准 Attention 另支持滑动窗口与低秩 Q/O 投影。
+- 压缩 Attention：CSA（细粒度压缩 + Lightning Indexer top-k + 滑窗）与 HCA（重度压缩 + 等距采样）。
+- FFN：Dense、Gated/SwiGLU、普通 MoE、LatentMoE 近似；MoE 支持 learned/hash 路由、多个共享专家和按组件权重精度。
 - Norm：RMSNorm、LayerNorm。
-- Residual：普通 Residual、AttnRes 近似。
+- Residual：普通 Residual、AttnRes 近似、mHC 多通道超连接。
 - Embedding、LM Head、Sampling 和显式 `unmodeled` 算子。
 - TP、连续层 PP、MoE 简化 EP，以及 Ring、Bus、Crossbar、2D Mesh 通信公式。
+- `rmsnorm_linear`、`rope_kv_write` 融合开关影响流量与 kernel 计量；`kv_paged` 按页粒度取整 KV 容量。
 - 容量不足时仍返回 TTFT、TPOT 和吞吐，并标记为理论性能。
 - 手动建模网页，可直接编辑模型、芯片、请求、经验效率和并行参数。
-- Qwen、Llama、MoE 和 Kimi K3 参数化草案等预设；预设只生成算子组合。
+- Qwen、Llama、MoE、Kimi K3 与 DeepSeek-V4 参数化草案等预设；预设只生成算子组合。
 
 暂不包含 CP、DP 模型并行、CPU/NVMe Offload、热点专家、网络拥塞、离散事件调度、服务排队和尾延迟。
 
@@ -45,6 +47,8 @@ python web_app.py --no-browser
 
 示例中的效率系数是依据公开评测资料约束校准的保守经验初值。公开资料提供的是端到端吞吐、TTFT、TPOT和容量分解，不能唯一反解单个算子的效率，因此这些数值不是实测真值：Dense示例使用`0.65/0.20`的Prefill/Decode GEMM效率、`0.50/0.15`的Attention效率、`0.15`的向量效率和`0.75`的HBM效率；MoE与KDA/MLA示例使用更保守的初值。用户应按硬件、框架、精度和Shape继续调整。
 
+GEMM 效率也可以改用形状感知口径：在 `execution.efficiencies.gemm_by_rows` 提供 `[[rows, efficiency], ...]` 校准点，模型会按每个 GEMM 的 M 维在 log2 域插值（两端取边界值），并覆盖 Prefill/Decode 常数效率；未配置时回退常数。MoE 专家 GEMM 的效率与 tile 对齐按平均每专家行数计量。
+
 ## 命令行与 Python API
 
 ```powershell
@@ -53,6 +57,7 @@ python -m transformer_modeling examples/tp4_gqa.json -o tp4_result.json
 python -m transformer_modeling examples/pp4_gqa.json -o pp4_result.json
 python -m transformer_modeling examples/moe_qwen3_30b_a3b.json -o moe_result.json
 python -m transformer_modeling examples/kimi_k3_base_tp64.json -o kimi_k3_result.json
+python -m transformer_modeling examples/deepseek_v4_pro_b200_nvl72.json -o v4_result.json
 ```
 
 稳定的顶层调用入口：
@@ -152,7 +157,7 @@ k3 = resolve_model_definition(preset_id="kimi-k3-draft", scenario="base")
 }
 ```
 
-`layer_pattern`按顺序循环展开并在达到 `layer_count` 时截断。未知算子类型直接报错；已知但没有性能公式的结构应使用 `unmodeled`：
+`layer_pattern`按顺序循环展开并在达到 `layer_count` 时截断。可选的 `layer_prefix` 用同样的层结构语法描述不参与循环的前置层，按声明顺序展开一次（长度不能超过 `layer_count`），剩余层再由 `layer_pattern` 循环填满；这用于表达前若干层结构特殊、之后才开始周期交替的模型。未知算子类型直接报错；已知但没有性能公式的结构应使用 `unmodeled`：
 
 ```json
 {
@@ -203,6 +208,8 @@ Bytes = ceil(N / block_size) × (block_size × bits/8 + scale_bytes)
 
 性能估算要求硬件提供对应的 `mxfp4_mxfp8_ops_per_second`，不会借用 INT4 吞吐。
 
+权重精度可以按算子甚至按组件覆盖：算子级 `weight_dtype`，MoE 另有 `routed_expert_weight_dtype` 与 `shared_expert_weight_dtype`，缺省逐级回落到 `dtype.weight`。口径边界是明确的：**按算子精度只改变权重字节数（容量与 HBM 流量），峰值算力仍按 `dtype.weight` 选定的硬件吞吐 key 取值**，不做逐算子算力切换。容量结果的每个 Stage 会给出 `weights_by_dtype`，按精度分桶列出权重字节。
+
 ## 并行模型
 
 总设备数必须满足：
@@ -213,7 +220,7 @@ DeviceCount = TP × EP × PP
 
 TP规则由算子声明。标准 Attention 和 Gated FFN采用 Column/Row Parallel，并在输出加入 All-Reduce；LM Head按词表分片并在采样前 All-Gather。
 
-PP按完整 Transformer 层连续切分，默认用当前请求下的 Prefill+Decode估算成本做近似均衡；也可以通过 `pipeline_stage_boundaries` 提供 `PP-1` 个累计层边界。Stage间传输 hidden activation。
+PP按完整 Transformer 层连续切分，默认用当前请求下的 Prefill+Decode估算成本做近似均衡；也可以通过 `pipeline_stage_boundaries` 提供 `PP-1` 个累计层边界。Stage间传输 hidden activation；发送占用互联而非算力，可与本 Stage 下一个微批的计算重叠。Decode 的稳态吞吐按流水稳态间隔（瓶颈 Stage 或链路）报告，可见 TPOT 仍按完整 makespan 报告。
 
 EP只作用于MoE：
 
@@ -236,6 +243,7 @@ S = M_local × TopK × H × activation_bytes
 - Llama/Qwen Dense：标准Attention + Gated FFN。
 - 普通MoE：标准Attention + MoE。
 - Kimi K3草案：3×KDA + 1×Gated MLA、AttnRes、LatentMoE近似。
+- DeepSeek-V4草案（`deepseek-v4-pro`、`deepseek-v4-flash`）：前2层滑窗Attention + 第3层CSA（均Hash路由），之后HCA/CSA交替；残差全部mHC，路由专家MXFP4、注意力与共享专家MXFP8。
 
 本地网页接口：
 
@@ -244,6 +252,8 @@ S = M_local × TopK × H × activation_bytes
 - `GET /api/model-presets`
 - `POST /api/model-definitions/resolve`
 - `POST /api/estimate`
+
+DeepSeek-V4预设同样是依据公开架构描述的参数化草案：Pro对账到1.6T参数、Flash对账到284B，未归属参数计入容量但不虚构FLOPs。其 `unsupported_features` 声明了MTP Block只计参数容量、YaRN与Muon属训练侧机制、Aux-Loss-Free bias与FP4 QAT不建模、Indexer的Hadamard变换与FP4量化按等效GEMM近似。压缩Attention与mHC的 `confidence` 为 `low`，各算子的 `assumptions` 列出了压缩比、top-k命中数与Sinkhorn融合等口径。
 
 Kimi K3预设是显式假设草案，不是官方 `config.json`。Base场景对账到2.8T参数，TP=1的含scale关键rank容量约1.35TiB；未归属参数计入容量但不虚构FLOPs。K3也使用普通算子组装入口，可以自行修改Pattern、启用PP或EP。
 
@@ -275,4 +285,4 @@ python -m unittest discover -s tests -p "test_*.py" -v
 Get-ChildItem static -Recurse -Filter *.js | ForEach-Object { node --check $_.FullName }
 ```
 
-测试覆盖单算子、混合Pattern、K3 2.8T容量、KDA/MLA状态、TP Shape、四种拓扑、PP划分、EP All-to-All、容量不足继续计算、网页API和ES Module语法。
+测试覆盖单算子、混合Pattern、K3 2.8T容量、KDA/MLA状态、TP Shape、四种拓扑、PP划分、EP All-to-All、容量不足继续计算、网页API和ES Module语法，以及DeepSeek-V4的层排列、Hash路由、压缩KV容量、mHC通道缩放和按精度分桶的权重字节。

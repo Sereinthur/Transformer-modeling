@@ -2,11 +2,27 @@
 
 from __future__ import annotations
 
-from math import ceil
+from math import ceil, log2
 from typing import Any
 
 from ..config import Config
 from .work_item import OPERATOR_LABELS, WorkItem
+
+
+def _interpolate_by_rows(table: tuple[tuple[int, float], ...], rows: int) -> float:
+    """在log2(rows)域对效率表做分段线性插值，两端取边界值。"""
+
+    if rows <= table[0][0]:
+        return table[0][1]
+    if rows >= table[-1][0]:
+        return table[-1][1]
+    for (low_rows, low_eff), (high_rows, high_eff) in zip(table, table[1:]):
+        if low_rows <= rows <= high_rows:
+            span = log2(high_rows) - log2(low_rows)
+            weight = (log2(rows) - log2(low_rows)) / span if span else 0.0
+            return low_eff + weight * (high_eff - low_eff)
+    return table[-1][1]
+
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║            OperatorCostModel — 将 WorkItem 账单转为耗时估算              ║
@@ -81,6 +97,14 @@ class OperatorCostModel:
                 execution.prefill_attention_efficiency
                 if phase == "prefill"
                 else execution.decode_attention_efficiency
+            )
+        elif (
+            execution.gemm_efficiency_by_rows is not None
+            and item.gemm_shape is not None
+        ):
+            # 形状感知效率：按GEMM的M维插值，代替Prefill/Decode常数。
+            efficiency = _interpolate_by_rows(
+                execution.gemm_efficiency_by_rows, item.gemm_shape[0]
             )
         else:
             efficiency = (

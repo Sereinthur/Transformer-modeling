@@ -6,11 +6,12 @@ from typing import Any
 
 from .attention import GatedMLAOperator, KDAOperator, StandardAttentionOperator
 from .base import TransformerOperator
+from .compressed_attention import CSAOperator, HCAOperator
 from .ffn import DenseFFNOperator, GatedFFNOperator, MoEOperator
 from .standard import (
-    AttnResOperator, LayerNormOperator, LMHeadOperator, RMSNormOperator,
-    SamplingOperator, StandardResidualOperator, TokenEmbeddingOperator,
-    UnmodeledOperator,
+    AttnResOperator, LayerNormOperator, LMHeadOperator, MHCOperator,
+    RMSNormOperator, SamplingOperator, StandardResidualOperator,
+    TokenEmbeddingOperator, UnmodeledOperator,
 )
 
 
@@ -25,8 +26,9 @@ def register(operator: TransformerOperator) -> None:
 
 for _operator in (
     TokenEmbeddingOperator(), RMSNormOperator(), LayerNormOperator(),
-    StandardResidualOperator(), AttnResOperator(), StandardAttentionOperator(),
-    KDAOperator(), GatedMLAOperator(), DenseFFNOperator(), GatedFFNOperator(),
+    StandardResidualOperator(), AttnResOperator(), MHCOperator(),
+    StandardAttentionOperator(), KDAOperator(), GatedMLAOperator(),
+    CSAOperator(), HCAOperator(), DenseFFNOperator(), GatedFFNOperator(),
     MoEOperator(), LMHeadOperator(), SamplingOperator(), UnmodeledOperator(),
 ):
     register(_operator)

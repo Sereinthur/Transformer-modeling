@@ -4,8 +4,8 @@ import { $ } from "./dom.js";
 
 const OPTIONS = {
   norm: [["rms_norm", "RMSNorm"], ["layer_norm", "LayerNorm"], ["unmodeled", "未建模（只计容量）"]],
-  attention: [["standard_attention", "标准Attention"], ["kda", "KDA"], ["gated_mla", "Gated MLA"], ["unmodeled", "未建模（只计容量）"]],
-  residual: [["standard_residual", "普通Residual"], ["attnres", "AttnRes"], ["unmodeled", "未建模（只计容量）"]],
+  attention: [["standard_attention", "标准Attention"], ["kda", "KDA"], ["gated_mla", "Gated MLA"], ["csa_attention", "CSA压缩稀疏注意力"], ["hca_attention", "HCA重度压缩注意力"], ["unmodeled", "未建模（只计容量）"]],
+  residual: [["standard_residual", "普通Residual"], ["attnres", "AttnRes"], ["mhc", "mHC超连接"], ["unmodeled", "未建模（只计容量）"]],
   ffn: [["dense_ffn", "Dense FFN"], ["gated_ffn", "Gated FFN / SwiGLU"], ["moe", "MoE / LatentMoE近似"], ["unmodeled", "未建模（只计容量）"]],
 };
 

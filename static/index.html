@@ -192,7 +192,11 @@
                 <label class="field"><span>路由专家数 E</span><input id="expert-count" type="number" min="1" step="1" required></label>
                 <label class="field"><span>每 token 激活专家 Top-K</span><input id="experts-per-token" type="number" min="1" step="1" required></label>
                 <label class="field"><span>单专家中间维度</span><input id="expert-intermediate-size" type="number" min="1" step="1" required></label>
-                <label class="field"><span>共享专家总中间维度</span><input id="shared-expert-intermediate-size" type="number" min="0" step="1" required></label>
+                <label class="field"><span>单个共享专家中间维度</span><input id="shared-expert-intermediate-size" type="number" min="0" step="1" required></label>
+                <label class="field"><span>共享专家个数</span><input id="shared-expert-count" type="number" min="0" step="1" value="1"></label>
+                <label class="field"><span>路由方式</span><select id="moe-routing"><option value="learned">可学习Router</option><option value="hash">Hash固定路由</option></select></label>
+                <label class="field"><span>路由专家权重精度</span><select id="routed-expert-dtype"></select></label>
+                <label class="field"><span>共享专家权重精度</span><select id="shared-expert-dtype"></select></label>
                 <label class="field span-2"><span>路由不均衡 / 容量填充系数</span><input id="routing-imbalance-factor" type="number" min="1" step="any" required></label>
               </div>
               <div class="formula-note"><strong>MoE范围</strong><span id="ffn-architecture-note">Pattern选择MoE时使用这些路由与专家参数。</span></div>
@@ -206,6 +210,24 @@
                 <label class="field"><span>Head Dim</span><input id="head-dim" type="number" min="1" step="1" required></label>
               </div>
             </fieldset>
+            <fieldset class="subgroup" id="compressed-attention-fields" hidden>
+              <legend>压缩注意力（滑窗 / CSA / HCA）</legend>
+              <div class="field-grid cols-3">
+                <label class="field"><span>滑窗宽度 <small>0=全局</small></span><input id="attention-sliding-window" type="number" min="0" step="1" value="0"></label>
+                <label class="field"><span>Q LoRA Rank <small>0=直接投影</small></span><input id="attention-q-lora-rank" type="number" min="0" step="1" value="0"></label>
+                <label class="field"><span>O LoRA Rank <small>0=直接投影</small></span><input id="attention-o-lora-rank" type="number" min="0" step="1" value="0"></label>
+                <label class="field"><span>CSA 压缩率 m</span><input id="csa-compress-ratio" type="number" min="1" step="1" value="4"></label>
+                <label class="field"><span>CSA Entry 重叠 coff</span><input id="csa-compress-overlap" type="number" min="1" step="1" value="2"></label>
+                <label class="field"><span>CSA Top-K Entry 数</span><input id="csa-selected-entries" type="number" min="1" step="1" value="1024"></label>
+                <label class="field"><span>Indexer Heads</span><input id="csa-indexer-heads" type="number" min="1" step="1" value="128"></label>
+                <label class="field"><span>Indexer Head Dim</span><input id="csa-indexer-head-dim" type="number" min="1" step="1" value="128"></label>
+                <label class="field"><span>HCA 压缩率 m</span><input id="hca-compress-ratio" type="number" min="1" step="1" value="128"></label>
+                <label class="field"><span>HCA 采样 Entry 数</span><input id="hca-selected-entries" type="number" min="1" step="1" value="1024"></label>
+                <label class="field"><span>mHC 通道数 n</span><input id="mhc-channels" type="number" min="1" step="1" value="4"></label>
+                <label class="field"><span>mHC Sinkhorn 迭代</span><input id="mhc-sinkhorn-iters" type="number" min="0" step="1" value="20"></label>
+              </div>
+              <div class="formula-note"><strong>口径说明</strong><span>滑窗与低秩 Q/O 对标准 Attention 与 CSA/HCA 同时生效；CSA 用 Lightning Indexer 选 Top-K Entry，HCA 用等距采样且不叠加滑窗。</span></div>
+            </fieldset>
             <fieldset class="subgroup">
               <legend>数据精度</legend>
               <div class="field-grid cols-2">
@@ -213,6 +235,7 @@
                 <label class="field"><span>激活</span><select id="activation-dtype"></select></label>
                 <label class="field"><span>KV Cache</span><select id="kv-dtype"></select></label>
                 <label class="field"><span>Logits</span><select id="logits-dtype"></select></label>
+                <label class="field span-2"><span>注意力类算子权重精度</span><select id="attention-weight-dtype"></select></label>
               </div>
             </fieldset>
             <div class="switch-row">

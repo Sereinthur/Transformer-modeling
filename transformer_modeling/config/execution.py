@@ -98,6 +98,11 @@ class ExecutionSpec:
     # ── 5. 推理模式 ─────────────────────────────────────────────────────
     prefill_logits_mode: str                # Prefill logits 模式：last_token / all_prompt_tokens
 
+    # ── 6. 可选：GEMM 形状感知效率表 ─────────────────────────────────────
+    #   [[rows, efficiency], ...]，按 GEMM 的 M 维在 log2 域插值；
+    #   配置后对 gemm 类算子覆盖 Prefill/Decode 常数效率，未配置时回退常数。
+    gemm_efficiency_by_rows: tuple[tuple[int, float], ...] | None = None
+
     @classmethod
     def from_dict(cls, data: dict[str, Any], model_data: dict[str, Any]) -> "ExecutionSpec":
         # 按 JSON 子节点分组读取
@@ -106,6 +111,29 @@ class ExecutionSpec:
         fusion = data.get("fusion", {})
         memory = data.get("memory", {})
         inference = model_data.get("inference", {})
+
+        rows_table = efficiencies.get("gemm_by_rows")
+        parsed_table: tuple[tuple[int, float], ...] | None = None
+        if rows_table is not None:
+            if not isinstance(rows_table, list) or not rows_table:
+                raise ValueError(
+                    "execution.efficiencies.gemm_by_rows must be a non-empty array"
+                )
+            points = []
+            for entry in rows_table:
+                if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                    raise ValueError(
+                        "execution.efficiencies.gemm_by_rows entries must be [rows, efficiency]"
+                    )
+                rows_value, efficiency_value = int(entry[0]), float(entry[1])
+                _positive("execution.efficiencies.gemm_by_rows rows", rows_value)
+                _fraction("execution.efficiencies.gemm_by_rows efficiency", efficiency_value)
+                points.append((rows_value, efficiency_value))
+            if [item[0] for item in points] != sorted({item[0] for item in points}):
+                raise ValueError(
+                    "execution.efficiencies.gemm_by_rows rows must be strictly increasing"
+                )
+            parsed_table = tuple(points)
 
         spec = cls(
             # 1. 效率系数
@@ -138,6 +166,8 @@ class ExecutionSpec:
             kv_page_tokens=int(memory.get("kv_page_tokens", 16)),
             # 5. 推理模式
             prefill_logits_mode=str(inference.get("prefill_logits_mode", "last_token")),
+            # 6. 可选形状感知效率表
+            gemm_efficiency_by_rows=parsed_table,
         )
 
         # ── 校验：效率系数必须在 [0,1] ───────────────────────────────────

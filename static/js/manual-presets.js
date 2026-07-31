@@ -25,11 +25,13 @@ export function compatibilityMessages(config) {
     + Number(config.serving.output_length.value ?? config.serving.output_length) - 1;
   if (required > Number(config.serving.max_sequence_length)) messages.push({ severity: "critical", text: `请求需要${required} token，超过最大上下文。` });
   if (pp > Number(d.layer_count)) messages.push({ severity: "critical", text: `PP=${pp}超过层数${d.layer_count}。` });
+  if ((config.model.layer_prefix || []).length) messages.push({ severity: "advisory", text: "该预设含前置层（layer_prefix），编辑器只展示循环部分，前置层按预设原样参与计算。" });
   patternOperators(config.model, "attention").forEach((operator) => {
     const heads = Number(operator.query_heads || operator.heads || 0);
     if (heads && heads % tp) messages.push({ severity: "critical", text: `${operator.type}的Heads=${heads}不能被TP=${tp}整除。` });
     const kv = Number(operator.kv_heads || 0);
     if (kv && kv % tp && tp % kv) messages.push({ severity: "critical", text: `${operator.type}的KV Heads=${kv}无法在TP=${tp}下分片或等组复制。` });
+    if (Number(operator.selected_entries) && !Number(operator.compress_ratio)) messages.push({ severity: "critical", text: `${operator.type}的压缩率m必须大于0。` });
   });
   patternOperators(config.model, "ffn").forEach((operator) => {
     const width = Number(operator.expert_intermediate_size || operator.intermediate_size || d.intermediate_size);

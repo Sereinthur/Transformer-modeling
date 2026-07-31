@@ -3,124 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from math import ceil
 from typing import Any
 
-from ..operators.base import blocked_bytes
-from .composed_phase import (
-    balanced_layer_partition, build_estimates, summarize_parallel_phase,
-)
+from .capacity import capacity_summary
+from .composed_phase import balanced_layer_partition, summarize_parallel_phase
 
 
-def _extra_local_parameters(config) -> int:
-    model, parallel = config.model, config.parallelism
-    divisor = {
-        "replicated": 1,
-        "tp": parallel.tensor_parallel,
-        "ep": parallel.expert_parallel,
-        "tp_ep": parallel.tensor_parallel * parallel.expert_parallel,
-    }[model.extra_parameter_sharding]
-    # 未归属参数视为分布在全部层中，因此除声明的TP/EP外还随PP Stage切分。
-    return ceil(model.extra_parameters / (divisor * parallel.pipeline_parallel))
-
-
-def capacity_summary(config) -> dict[str, Any]:
-    """按算子参数、持久状态和最大临时缓冲汇总关键rank容量。"""
-
-    model, serving = config.model, config.serving
-    stages = balanced_layer_partition(config, model.expanded_layers())
-    active_ep = min(config.parallelism.expert_parallel, serving.batch_size)
-    local_batch = ceil(serving.batch_size / active_ep)
-    stage_results = []
-    logical_parameters = 0
-    tied = bool(model.embedding.get("tied_lm_head", True))
-    for index, layers in enumerate(stages):
-        estimates = build_estimates(
-            config, layers, "prefill", local_batch, serving.prompt_length,
-            serving.prompt_length, index == 0, index == len(stages) - 1,
-        )
-        local_parameters = sum(item.local_parameters for item in estimates)
-        global_parameters = sum(item.global_parameters for item in estimates)
-        # 单Stage且Embedding/LM Head共享时，物理容量和逻辑参数都只保留一份。
-        if tied and len(stages) == 1:
-            head = next((item for item in estimates if item.type_id == "lm_head"), None)
-            if head:
-                local_parameters -= head.local_parameters
-                global_parameters -= head.global_parameters
-        local_parameters += _extra_local_parameters(config)
-        weights = blocked_bytes(config, local_parameters, model.weight_dtype)
-        states = sum(item.persistent_state_bytes for item in estimates)
-        activations = max((item.temporary_bytes for item in estimates), default=0)
-        communication = max(
-            (request.payload_bytes for item in estimates for request in item.communication_requests),
-            default=0,
-        )
-        # 峰值按同一算子的临时空间与通信buffer共同存活来估计，避免把
-        # 不同执行时刻的两个独立最大值直接相加。
-        workspace = max((
-            item.temporary_bytes + max(
-                (request.payload_bytes for request in item.communication_requests),
-                default=0,
-            )
-            for item in estimates
-        ), default=0)
-        total = (
-            weights + states + ceil(workspace)
-            + config.hardware.runtime_reserved_bytes
-            + config.hardware.baseline_unavailable_bytes
-        )
-        breakdown: dict[str, int] = {}
-        for item in estimates:
-            for name, value in item.parameter_breakdown.items():
-                breakdown[name] = breakdown.get(name, 0) + value
-        if model.extra_parameters:
-            breakdown["unmodeled_parameters"] = _extra_local_parameters(config)
-        state_results: dict[str, int] = {}
-        for item in estimates:
-            for name, value in item.state_breakdown.items():
-                state_results[name] = state_results.get(name, 0) + value
-        stage_results.append({
-            "stage_index": index,
-            "layer_count": len(layers),
-            "local_parameters": local_parameters,
-            "weights_bytes": weights,
-            "weights_by_operator": breakdown,
-            "persistent_state_bytes": states,
-            "states_by_operator": state_results,
-            "activations_peak_bytes": activations,
-            "communication_buffer_peak_bytes": ceil(communication),
-            "combined_workspace_peak_bytes": ceil(workspace),
-            "runtime_reserved_bytes": config.hardware.runtime_reserved_bytes,
-            "baseline_unavailable_bytes": config.hardware.baseline_unavailable_bytes,
-            "peak_total_bytes": total,
-            "headroom_bytes": config.hardware.device_memory_capacity_bytes - total,
-        })
-        logical_parameters += global_parameters
-    # PP物理复制不应重复计入模型的逻辑参数量。
-    if tied and len(stages) > 1:
-        logical_parameters -= model.padded_vocab_size * model.hidden_size
-    logical_parameters += model.extra_parameters
-    critical = max(stage_results, key=lambda item: item["peak_total_bytes"])
-    capacity = config.hardware.device_memory_capacity_bytes
-    return {
-        "capacity_feasible": critical["peak_total_bytes"] <= capacity,
-        "performance_is_theoretical": critical["peak_total_bytes"] > capacity,
-        "scope": "critical_rank",
-        "model_logical_parameters": logical_parameters,
-        "critical_stage_index": critical["stage_index"],
-        "required_bytes_per_critical_rank": critical["peak_total_bytes"],
-        "available_bytes_per_rank": capacity,
-        "capacity_shortfall_bytes": max(0, critical["peak_total_bytes"] - capacity),
-        "headroom_bytes": capacity - critical["peak_total_bytes"],
-        "per_stage": stage_results,
-        "notes": [
-            "权重和持久状态求和；工作区按单算子临时空间与其通信buffer的共同峰值近似。",
-            "容量不足不阻止理论性能估算。",
-        ],
-    }
-
-
-def _decode_summary(config, details: bool) -> tuple[dict[str, Any], float]:
+def _decode_summary(config, details: bool,
+                    stages: list[list[object]] | None = None) -> tuple[dict[str, Any], float]:
     steps = max(0, config.serving.output_length - 1)
     if not steps:
         return {
@@ -130,14 +20,19 @@ def _decode_summary(config, details: bool) -> tuple[dict[str, Any], float]:
             "performance_complete": True,
         }, 0.0
     first = summarize_parallel_phase(
-        config, "decode", config.serving.prompt_length, details
+        config, "decode", config.serving.prompt_length, details, stages
     )
     last_length = config.serving.prompt_length + steps - 1
     last = first if steps == 1 else summarize_parallel_phase(
-        config, "decode", last_length, details
+        config, "decode", last_length, details, stages
     )
     mean = (first["latency_seconds"] + last["latency_seconds"]) / 2
     total = mean * steps
+    # 稳态吞吐用流水稳态间隔：PP>1时token间可跨Stage流水，间隔受瓶颈Stage限制。
+    steady = (
+        first["pipeline_schedule"]["steady_state_interval_seconds"]
+        + last["pipeline_schedule"]["steady_state_interval_seconds"]
+    ) / 2
     return {
         "steps": steps,
         "total_latency_seconds": total,
@@ -145,11 +40,12 @@ def _decode_summary(config, details: bool) -> tuple[dict[str, Any], float]:
             "mean_seconds": mean,
             "first_seconds": first["latency_seconds"],
             "last_seconds": last["latency_seconds"],
+            "steady_state_seconds": steady,
         },
         "first_step": first,
         "last_step": last,
         "performance_complete": first["performance_complete"] and last["performance_complete"],
-        "steady_state_output_tokens_per_second": config.serving.batch_size / mean if mean else None,
+        "steady_state_output_tokens_per_second": config.serving.batch_size / steady if steady else None,
     }, total
 
 
@@ -183,7 +79,9 @@ def _model_summary(config, capacity: dict[str, Any]) -> dict[str, Any]:
     counts: dict[str, int] = {}
     layers = config.model.expanded_layers()
     for layer in layers:
-        for spec in (layer.attention, layer.ffn, layer.residual, layer.residual):
+        # 每层骨架包含2×Norm、1×Attention、1×FFN和2×Residual。
+        for spec in (layer.norm, layer.attention, layer.residual,
+                     layer.norm, layer.ffn, layer.residual):
             counts[spec.type] = counts.get(spec.type, 0) + 1
     if layers and layers[-1].residual.type == "attnres":
         counts["attnres"] = counts.get("attnres", 0) + 1
@@ -197,7 +95,9 @@ def _model_summary(config, capacity: dict[str, Any]) -> dict[str, Any]:
 
 
 def estimate_composed(config, details: bool = True, include_scaling: bool = True) -> dict[str, Any]:
-    capacity = capacity_summary(config)
+    # 层划分只依赖config，在一次估算内计算一次并透传给容量与各阶段。
+    stages = balanced_layer_partition(config, config.model.expanded_layers())
+    capacity = capacity_summary(config, stages)
     incomplete_extra = config.model.extra_parameters > 0
     warnings: list[str] = []
     if not capacity["capacity_feasible"]:
@@ -238,9 +138,9 @@ def estimate_composed(config, details: bool = True, include_scaling: bool = True
         return result
 
     prefill = summarize_parallel_phase(
-        config, "prefill", config.serving.prompt_length, details
+        config, "prefill", config.serving.prompt_length, details, stages
     )
-    decode, decode_seconds = _decode_summary(config, details)
+    decode, decode_seconds = _decode_summary(config, details, stages)
     complete = prefill["performance_complete"] and decode["performance_complete"] and not incomplete_extra
     result["validity"]["performance_complete"] = complete
     prefill_seconds = prefill["latency_seconds"]

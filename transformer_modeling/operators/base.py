@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from math import ceil
 from typing import TYPE_CHECKING, Any
 
+from ..config.common import dtype_bytes
 from ..core.work_item import WorkItem, _gemm
 
 if TYPE_CHECKING:
@@ -40,6 +41,8 @@ class OperatorEstimate:
     assumptions: list[str] = field(default_factory=list)
     confidence: str = "medium"
     performance_complete: bool = True
+    # 空映射表示全部本地参数按模型权重精度计；否则按精度分桶（合计应等于local_parameters）。
+    local_parameters_by_dtype: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -128,6 +131,16 @@ def int_param(spec: "OperatorSpec", name: str, default: int | None = None) -> in
     return result
 
 
+def optional_int(spec: "OperatorSpec", name: str, default: int = 0) -> int:
+    """可选的非负整型参数；0通常表示“关闭该机制”。"""
+
+    value = spec.get(name, default)
+    result = int(value or 0)
+    if result < 0:
+        raise ValueError(f"operator {spec.type}.{name} cannot be negative")
+    return result
+
+
 def effective_element_bytes(config: "Config", dtype: str) -> float:
     raw = {
         "mxfp4": 0.5, "int4": 0.5, "mxfp8": 1.0, "fp8": 1.0,
@@ -153,13 +166,53 @@ def local_kv_heads(kv_heads: int, tp: int) -> int:
     return kv_heads // tp if kv_heads % tp == 0 else 1
 
 
+def paged_kv_tokens(config: "Config", tokens: int) -> int:
+    """KV分页管理时，每个序列的cache容量按页粒度向上取整。"""
+
+    execution = config.execution
+    if not execution.kv_paged:
+        return tokens
+    page = execution.kv_page_tokens
+    return ceil(tokens / page) * page
+
+
+def resolve_weight_dtype(
+    config: "Config", spec: "OperatorSpec", key: str = "weight_dtype",
+    fallback: str | None = None,
+) -> str:
+    """解析算子级权重精度；缺省回落到模型权重精度，非法取值直接报错。"""
+
+    value = spec.get(key)
+    if value is None or value == "":
+        return fallback or config.model.weight_dtype
+    name = str(value).lower()
+    dtype_bytes(name)
+    return name
+
+
+def windowed_tokens(tokens: int, window: int) -> int:
+    """滑窗注意力下单个query实际可见的token数（window<=0表示全局）。"""
+
+    if window <= 0:
+        return tokens
+    return min(tokens, window)
+
+
+def windowed_pairs(length: int, window: int) -> int:
+    """因果掩码下窗口内的(query, key)对数；window<=0退化为稠密下三角。"""
+
+    if window <= 0 or window >= length:
+        return length * (length + 1) // 2
+    return window * (window + 1) // 2 + (length - window) * window
+
+
 def gemm(
     name: str, m: int, k: int, n: int, ctx: OperatorContext,
-    output_bytes: float | None = None,
+    output_bytes: float | None = None, weight_dtype: str | None = None,
 ) -> WorkItem:
     model = ctx.model
     ba = effective_element_bytes(ctx.config, model.activation_dtype)
-    bw = effective_element_bytes(ctx.config, model.weight_dtype)
+    bw = effective_element_bytes(ctx.config, weight_dtype or model.weight_dtype)
     return _gemm(
         name, m, k, n, ba, bw, output_bytes or ba, ctx.occurrence_count
     )

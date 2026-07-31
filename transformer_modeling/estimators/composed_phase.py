@@ -159,16 +159,24 @@ def _layer_weights(config, layers) -> list[float]:
     weights = []
     active = min(config.parallelism.expert_parallel, config.serving.batch_size)
     local_batch = ceil(config.serving.batch_size / active)
+    # 相同签名的层成本一致，只估算一次。
+    cache: dict[tuple, float] = {}
     for layer in layers:
-        prefill = summarize_stage(
-            config, [layer], "prefill", local_batch, config.serving.prompt_length,
-            config.serving.prompt_length, False, False, False,
-        )["latency_seconds"]
-        decode = summarize_stage(
-            config, [layer], "decode", local_batch, 1,
-            config.serving.prompt_length, False, False, False,
-        )["latency_seconds"]
-        weights.append(prefill + max(0, config.serving.output_length - 1) * decode)
+        key = (
+            layer.norm.signature(), layer.attention.signature(),
+            layer.residual.signature(), layer.ffn.signature(),
+        )
+        if key not in cache:
+            prefill = summarize_stage(
+                config, [layer], "prefill", local_batch, config.serving.prompt_length,
+                config.serving.prompt_length, False, False, False,
+            )["latency_seconds"]
+            decode = summarize_stage(
+                config, [layer], "decode", local_batch, 1,
+                config.serving.prompt_length, False, False, False,
+            )["latency_seconds"]
+            cache[key] = prefill + max(0, config.serving.output_length - 1) * decode
+        weights.append(cache[key])
     return weights
 
 
@@ -211,9 +219,10 @@ def balanced_layer_partition(config, layers) -> list[list[object]]:
 
 
 def summarize_parallel_phase(config, phase: str, attention_length: int,
-                             details: bool = True) -> dict[str, Any]:
-    layers = config.model.expanded_layers()
-    stages = balanced_layer_partition(config, layers)
+                             details: bool = True,
+                             stages: list[list[object]] | None = None) -> dict[str, Any]:
+    if stages is None:
+        stages = balanced_layer_partition(config, config.model.expanded_layers())
     microbatches = config.parallelism.pipeline_microbatches
     micro_batch = config.serving.batch_size // microbatches
     active_ep = min(config.parallelism.expert_parallel, micro_batch)

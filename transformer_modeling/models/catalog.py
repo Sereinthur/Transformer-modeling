@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from math import floor
+from math import ceil, floor
 from typing import Any
 
 
@@ -24,6 +24,16 @@ _K3_SCENARIOS = {
     "compact": (48, 6144, 0.75), "base": (64, 7168, 1.0),
     "deep_wide": (80, 8192, 1.25),
 }
+
+# layer_count, hidden, query_heads, head_dim, lora_rank, experts, expert_width,
+# selected_entries, parameter_target
+_V4_VARIANTS = {
+    "pro": (61, 7168, 128, 512, 1536, 384, 3072, 1024, 1_600_000_000_000),
+    "flash": (43, 4096, 64, 512, 1024, 256, 2048, 512, 284_000_000_000),
+}
+_V4_VOCAB, _V4_WINDOW, _V4_ROPE = 129280, 128, 64
+_V4_INDEXER_HEADS, _V4_INDEXER_DIM = 128, 128
+_V4_CHANNELS, _V4_PREFIX_LAYERS = 4, 3
 
 
 def _base_model(model_id: str, name: str, layers: int, hidden: int,
@@ -120,6 +130,99 @@ def kimi_k3_definition(scenario: str = "base") -> tuple[dict[str, Any], int]:
     return model, 1_048_576
 
 
+def _v4_modeled_parameters(variant: str) -> int:
+    """解析式累加已建模的逻辑参数，口径与各算子global_parameters一致。"""
+
+    layers, h, qh, dim, lora, experts, width, _, _ = _V4_VARIANTS[variant]
+    rest = layers - _V4_PREFIX_LAYERS
+    hca_layers, csa_layers = ceil(rest / 2), 1 + rest // 2
+    swa_layers = _V4_PREFIX_LAYERS - 1
+    q_path = h * lora + lora * qh * dim
+    o_path = qh * dim * lora + lora * h
+    swa_per = q_path + 2 * h * dim + o_path
+    indexer = h * _V4_INDEXER_HEADS * _V4_INDEXER_DIM + h * _V4_INDEXER_DIM + _V4_INDEXER_HEADS
+    csa_per = q_path + o_path + h * 2 * (2 * dim) + 4 * (2 * dim) + indexer
+    hca_per = q_path + o_path + h * 2 * dim + 128 * dim
+    moe_per = 3 * h * (experts * width + width)
+    return (
+        2 * _V4_VOCAB * h + (2 * layers + 1) * h
+        + layers * 2 * 3 * _V4_CHANNELS ** 2
+        + swa_layers * swa_per + csa_layers * csa_per + hca_layers * hca_per
+        + layers * moe_per + rest * h * experts
+    )
+
+
+def deepseek_v4_definition(variant: str = "pro") -> tuple[dict[str, Any], int]:
+    if variant not in _V4_VARIANTS:
+        raise ValueError(f"unknown DeepSeek-V4 variant: {variant}")
+    layers, h, qh, dim, lora, experts, width, selected, target = _V4_VARIANTS[variant]
+    model = _base_model(
+        f"deepseek-v4-{variant}", f"DeepSeek-V4-{variant.capitalize()}",
+        layers, h, 4 * h, _V4_VOCAB, "mxfp4",
+    )
+    model["dtype"].update({
+        "activation": "mxfp8", "kv_cache": "mxfp8", "state": "mxfp8", "accumulation": "bf16",
+    })
+    # FP8注意力权重 + FP4路由专家：按算子/按组件的权重精度覆盖。
+    attention = {
+        "query_heads": qh, "kv_heads": 1, "head_dim": dim,
+        "q_lora_rank": lora, "o_lora_rank": lora, "weight_dtype": "mxfp8",
+    }
+    swa = dict(
+        attention, type="standard_attention", implementation="flash_attention",
+        sliding_window=_V4_WINDOW, query_width_equals_hidden=False,
+    )
+    csa = dict(
+        attention, type="csa_attention", implementation="compressed_kv",
+        compress_ratio=4, compress_overlap=2, selected_entries=selected,
+        sliding_window=_V4_WINDOW, selector="indexer",
+        indexer_heads=_V4_INDEXER_HEADS, indexer_head_dim=_V4_INDEXER_DIM,
+        qk_rope_head_dim=_V4_ROPE,
+    )
+    hca = dict(
+        attention, type="hca_attention", implementation="compressed_kv",
+        compress_ratio=128, compress_overlap=1, selected_entries=selected,
+        sliding_window=0, selector="uniform", qk_rope_head_dim=_V4_ROPE,
+    )
+    moe = {
+        "type": "moe", "implementation": "standard_moe", "expert_count": experts,
+        "experts_per_token": 6, "expert_intermediate_size": width,
+        "shared_expert_intermediate_size": width, "shared_expert_count": 1,
+        "activation": "swiglu", "gate_activation": "sqrtsoftplus",
+        "routed_scaling_factor": 1.5, "routing": "learned",
+        "weight_dtype": "mxfp8", "routed_expert_weight_dtype": "mxfp4",
+        "shared_expert_weight_dtype": "mxfp8",
+    }
+    moe_hash = dict(moe, routing="hash")
+    norm, residual = {"type": "rms_norm"}, {
+        "type": "mhc", "channels": _V4_CHANNELS, "sinkhorn_iters": 20,
+    }
+    layer = lambda repeat, attn, ffn: {
+        "repeat": repeat, "norm": norm, "attention": attn,
+        "residual": residual, "ffn": ffn,
+    }
+    modeled = _v4_modeled_parameters(variant)
+    model.update({
+        "embedding": {"type": "token_embedding", "tied_lm_head": False},
+        # 前2层纯滑窗 + 第3层CSA，均用Hash路由；之后HCA/CSA交替到最后一层。
+        "layer_prefix": [layer(2, swa, moe_hash), layer(1, csa, moe_hash)],
+        "layer_pattern": [layer(1, hca, moe), layer(1, csa, moe)],
+        "output": {"norm": norm, "head": {"type": "lm_head"}, "sampling": {"type": "sampling"}},
+        "extra": {"parameter_count": max(0, target - modeled), "sharding": "tp_ep"},
+        "metadata": {
+            "family": "DeepSeek-V4", "variant": variant,
+            "mapping_quality": "parameterized_draft", "parameter_target": target,
+            "unsupported_features": [
+                "MTP Block（1层）只计参数容量，不建模投机推理流程",
+                "YaRN与Muon属训练侧机制，不影响推理账单",
+                "Aux-Loss-Free bias与FP4 QAT不建模",
+                "Indexer的Hadamard变换与FP4量化按等效GEMM近似",
+            ],
+        },
+    })
+    return model, 1_048_576
+
+
 def preset_catalog() -> dict[str, Any]:
     presets = []
     for preset_id in _DENSE:
@@ -129,6 +232,9 @@ def preset_catalog() -> dict[str, Any]:
     presets.append({"id": model["id"], "name": model["name"], "family": "Qwen3 MoE", "mapping_quality": "approximate", "unsupported_features": model["metadata"]["unsupported_features"], "model": model, "default_max_sequence_length": context})
     k3, context = kimi_k3_definition()
     presets.append({"id": "kimi-k3-draft", "name": "Kimi K3（参数化草案）", "family": "Kimi K3 Hybrid MoE", "mapping_quality": "parameterized_draft", "unsupported_features": k3["metadata"]["unsupported_features"], "model": k3, "scenarios": list(_K3_SCENARIOS), "default_scenario": "base", "default_max_sequence_length": context})
+    for variant in _V4_VARIANTS:
+        v4, context = deepseek_v4_definition(variant)
+        presets.append({"id": v4["id"], "name": v4["name"], "family": "DeepSeek-V4", "mapping_quality": "parameterized_draft", "unsupported_features": v4["metadata"]["unsupported_features"], "model": v4, "default_max_sequence_length": context})
     return {"schema_version": 2, "snapshot_date": "2026-07-20", "presets": presets}
 
 

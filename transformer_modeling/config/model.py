@@ -54,6 +54,8 @@ class ModelSpec:
     extra_parameters: int
     extra_parameter_sharding: str
     metadata: dict[str, Any]
+    # 前置层Pattern：先按顺序展开这些层，剩下的层才按layer_pattern循环。
+    layer_prefix: tuple[LayerPatternSpec, ...] = ()
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ModelSpec":
@@ -65,6 +67,9 @@ class ModelSpec:
             raise ValueError("model.layer_pattern must be a non-empty array")
         inference = data.get("inference", {})
         extras = data.get("extra", {})
+        prefixes = data.get("layer_prefix", [])
+        if not isinstance(prefixes, list):
+            raise ValueError("model.layer_prefix must be an array")
         spec = cls(
             model_id=str(data.get("id", data.get("model_id", "custom"))),
             name=str(data.get("name", "自定义Transformer")),
@@ -86,6 +91,7 @@ class ModelSpec:
             extra_parameters=int(extras.get("parameter_count", 0)),
             extra_parameter_sharding=str(extras.get("sharding", "tp_ep")).lower(),
             metadata=dict(data.get("metadata", {})),
+            layer_prefix=tuple(LayerPatternSpec.from_dict(item) for item in prefixes),
         )
         for field in (
             "layer_count", "hidden_size", "intermediate_size",
@@ -100,15 +106,24 @@ class ModelSpec:
             raise ValueError("model.extra.parameter_count cannot be negative")
         if spec.extra_parameter_sharding not in {"replicated", "tp", "ep", "tp_ep"}:
             raise ValueError("model.extra.sharding must be replicated, tp, ep, or tp_ep")
+        prefix_length = sum(item.repeat for item in spec.layer_prefix)
+        if prefix_length > spec.layer_count:
+            raise ValueError(
+                "model.layer_prefix expands to more layers than model.dimensions.layer_count"
+            )
         return spec
 
     def expanded_layers(self) -> tuple[LayerPatternSpec, ...]:
-        """循环展开Pattern，直到得到精确的Transformer层数。"""
+        """先展开前置层，剩余层循环展开Pattern，直到得到精确的Transformer层数。"""
 
+        prefix = tuple(
+            item for pattern in self.layer_prefix for item in (pattern,) * pattern.repeat
+        )[:self.layer_count]
         cycle = tuple(
             item for pattern in self.layer_pattern for item in (pattern,) * pattern.repeat
         )
-        return tuple(cycle[index % len(cycle)] for index in range(self.layer_count))
+        rest = self.layer_count - len(prefix)
+        return prefix + tuple(cycle[index % len(cycle)] for index in range(rest))
 
     def operators(self) -> tuple[OperatorSpec, ...]:
         items: list[OperatorSpec] = [self.embedding]

@@ -6,10 +6,14 @@ import { patternUses, readPatternRows, writePatternRows } from "./pattern-editor
 
 const DTYPE_OPTIONS = ["fp32", "tf32", "bf16", "fp16", "fp8", "mxfp8", "int8", "int4", "mxfp4"];
 let modelMetadata = {};
+let modelLayerPrefix = [];
 let modelIdentity = { id: "custom", name: "自定义Transformer" };
 
 export function populateDtypes() {
-  ["weight-dtype", "activation-dtype", "kv-dtype", "logits-dtype", "kda-state-dtype", "accumulation-dtype"].forEach((id) => {
+  [
+    "weight-dtype", "activation-dtype", "kv-dtype", "logits-dtype", "kda-state-dtype",
+    "accumulation-dtype", "attention-weight-dtype", "routed-expert-dtype", "shared-expert-dtype",
+  ].forEach((id) => {
     const select = document.getElementById(id);
     select.innerHTML = DTYPE_OPTIONS.map((dtype) => `<option value="${dtype}">${dtype.toUpperCase()}</option>`).join("");
   });
@@ -34,6 +38,8 @@ export function fillForm(config) {
   const throughput = h.compute.throughput;
   const measured = h.compute.measured_throughput || {};
   modelMetadata = JSON.parse(JSON.stringify(m.metadata || {}));
+  // 预设的前置层不可在编辑器里表达，原样保留避免丢失层排列。
+  modelLayerPrefix = JSON.parse(JSON.stringify(m.layer_prefix || []));
   modelIdentity = { id: m.id || "custom", name: m.name || "自定义Transformer" };
 
   setValue("hardware-name", h.name);
@@ -59,6 +65,9 @@ export function fillForm(config) {
   const standard = operatorOfType(m, "standard_attention");
   const kda = operatorOfType(m, "kda");
   const mla = operatorOfType(m, "gated_mla");
+  const csa = operatorOfType(m, "csa_attention");
+  const hca = operatorOfType(m, "hca_attention");
+  const compressed = csa.type ? csa : hca;
   const unmodeled = m.layer_pattern.flatMap((item) => [item.norm, item.attention, item.residual, item.ffn]).find((item) => item?.type === "unmodeled") || {};
   const attention = kda.type ? kda : (mla.type ? mla : standard);
   writePatternRows(m.layer_pattern);
@@ -78,6 +87,18 @@ export function fillForm(config) {
   setValue("mla-v-dim", mla.v_head_dim ?? 128);
   const residual = firstOperator(m, "residual");
   setValue("attnres-blocks", residual.block_count ?? 8);
+  setValue("attention-sliding-window", standard.sliding_window ?? compressed.sliding_window ?? 0);
+  setValue("attention-q-lora-rank", standard.q_lora_rank ?? compressed.q_lora_rank ?? 0);
+  setValue("attention-o-lora-rank", standard.o_lora_rank ?? compressed.o_lora_rank ?? 0);
+  setValue("csa-compress-ratio", csa.compress_ratio ?? 4);
+  setValue("csa-compress-overlap", csa.compress_overlap ?? 2);
+  setValue("csa-selected-entries", csa.selected_entries ?? 1024);
+  setValue("csa-indexer-heads", csa.indexer_heads ?? 128);
+  setValue("csa-indexer-head-dim", csa.indexer_head_dim ?? 128);
+  setValue("hca-compress-ratio", hca.compress_ratio ?? 128);
+  setValue("hca-selected-entries", hca.selected_entries ?? 1024);
+  setValue("mhc-channels", residual.channels ?? 4);
+  setValue("mhc-sinkhorn-iters", residual.sinkhorn_iters ?? 20);
 
   const ffn = firstOperator(m, "ffn");
   const moe = ffn.type === "moe";
@@ -86,6 +107,8 @@ export function fillForm(config) {
   setValue("experts-per-token", ffn.experts_per_token ?? 2);
   setValue("expert-intermediate-size", ffn.expert_intermediate_size ?? d.intermediate_size);
   setValue("shared-expert-intermediate-size", ffn.shared_expert_intermediate_size ?? 0);
+  setValue("shared-expert-count", ffn.shared_expert_count ?? 1);
+  setValue("moe-routing", ffn.routing ?? "learned");
   setValue("routing-imbalance-factor", 1);
   setValue("hybrid-moe-variant", ffn.implementation === "latent_moe_approx" ? "latent_moe_approximation" : "standard_moe");
   setValue("situ-ops", ffn.situ_ops_per_element ?? 6);
@@ -100,6 +123,9 @@ export function fillForm(config) {
   setValue("logits-dtype", m.dtype.logits);
   setValue("kda-state-dtype", m.dtype.state ?? m.dtype.kv_cache);
   setValue("accumulation-dtype", m.dtype.accumulation ?? "fp32");
+  setValue("attention-weight-dtype", standard.weight_dtype ?? compressed.weight_dtype ?? m.dtype.weight);
+  setValue("routed-expert-dtype", ffn.routed_expert_weight_dtype ?? ffn.weight_dtype ?? m.dtype.weight);
+  setValue("shared-expert-dtype", ffn.shared_expert_weight_dtype ?? ffn.weight_dtype ?? m.dtype.weight);
   setValue("quant-block-size", m.quantization?.block_size ?? 32);
   setValue("quant-scale-bytes", m.quantization?.scale_bytes ?? 1);
   setValue("hybrid-parameter-target-b", (m.metadata?.parameter_target || 0) / 1e9);
@@ -173,8 +199,18 @@ export function updateFfnFields() {
 export function updateAttentionArchitectureFields() {
   const sequenceState = patternUses("kda", "attention") || patternUses("gated_mla", "attention");
   const specialized = sequenceState || patternUses("attnres", "residual") || patternUses("unmodeled");
+  const csa = patternUses("csa_attention", "attention");
+  const hca = patternUses("hca_attention", "attention");
+  const mhc = patternUses("mhc", "residual");
+  const standard = patternUses("standard_attention", "attention");
   $("#hybrid-fields").hidden = !specialized;
   $("#hybrid-serving-fields").hidden = !sequenceState;
+  $("#compressed-attention-fields").hidden = !(standard || csa || hca || mhc);
+  ["csa-compress-ratio", "csa-compress-overlap", "csa-selected-entries", "csa-indexer-heads", "csa-indexer-head-dim"]
+    .forEach((id) => { document.getElementById(id).disabled = !csa; });
+  ["hca-compress-ratio", "hca-selected-entries"].forEach((id) => { document.getElementById(id).disabled = !hca; });
+  ["mhc-channels", "mhc-sinkhorn-iters"].forEach((id) => { document.getElementById(id).disabled = !mhc; });
+  $("#attention-sliding-window").disabled = !(standard || csa || hca);
   $("#attnres-blocks").disabled = !patternUses("attnres", "residual");
   $("#situ-ops").disabled = $("#hybrid-moe-variant").value === "standard_moe";
 }
@@ -182,14 +218,32 @@ export function updateAttentionArchitectureFields() {
 function ffnSpec(type) {
   if (type === "unmodeled") return unmodeledSpec();
   if (type !== "moe") return { type, implementation: type === "dense_ffn" ? "gelu" : "swiglu", intermediate_size: numberValue("intermediate-size") };
-  return { type: "moe", implementation: $("#hybrid-moe-variant").value === "latent_moe_approximation" ? "latent_moe_approx" : "standard_moe", expert_count: numberValue("expert-count"), experts_per_token: numberValue("experts-per-token"), expert_intermediate_size: numberValue("expert-intermediate-size"), shared_expert_intermediate_size: numberValue("shared-expert-intermediate-size"), activation: $("#ffn-type").value, situ_ops_per_element: numberValue("situ-ops") };
+  return { type: "moe", implementation: $("#hybrid-moe-variant").value === "latent_moe_approximation" ? "latent_moe_approx" : "standard_moe", expert_count: numberValue("expert-count"), experts_per_token: numberValue("experts-per-token"), expert_intermediate_size: numberValue("expert-intermediate-size"), shared_expert_intermediate_size: numberValue("shared-expert-intermediate-size"), shared_expert_count: numberValue("shared-expert-count"), routing: $("#moe-routing").value, activation: $("#ffn-type").value, situ_ops_per_element: numberValue("situ-ops"), routed_expert_weight_dtype: $("#routed-expert-dtype").value, shared_expert_weight_dtype: $("#shared-expert-dtype").value };
+}
+
+function compressedAttentionSpec(type) {
+  const csa = type === "csa_attention";
+  return {
+    type, implementation: "compressed_kv",
+    query_heads: numberValue("query-heads"), kv_heads: numberValue("kv-heads"), head_dim: numberValue("head-dim"),
+    compress_ratio: numberValue(csa ? "csa-compress-ratio" : "hca-compress-ratio"),
+    compress_overlap: csa ? numberValue("csa-compress-overlap") : 1,
+    selected_entries: numberValue(csa ? "csa-selected-entries" : "hca-selected-entries"),
+    sliding_window: csa ? numberValue("attention-sliding-window") : 0,
+    selector: csa ? "indexer" : "uniform",
+    indexer_heads: numberValue("csa-indexer-heads"), indexer_head_dim: numberValue("csa-indexer-head-dim"),
+    qk_rope_head_dim: numberValue("mla-rope-dim"),
+    q_lora_rank: numberValue("attention-q-lora-rank"), o_lora_rank: numberValue("attention-o-lora-rank"),
+    weight_dtype: $("#attention-weight-dtype").value,
+  };
 }
 
 function attentionSpec(type) {
   if (type === "unmodeled") return unmodeledSpec();
   if (type === "kda") return { type, implementation: "chunkwise", heads: numberValue("hybrid-kda-heads"), key_dim: numberValue("kda-key-dim"), value_dim: numberValue("kda-value-dim"), short_conv_kernel_size: numberValue("hybrid-kda-conv-size"), chunk_size: numberValue("kda-chunk-size") };
   if (type === "gated_mla") return { type, implementation: "latent_cache", query_heads: numberValue("query-heads"), q_lora_rank: numberValue("mla-q-rank"), kv_lora_rank: numberValue("mla-kv-rank"), qk_nope_head_dim: numberValue("mla-nope-dim"), qk_rope_head_dim: numberValue("mla-rope-dim"), v_head_dim: numberValue("mla-v-dim") };
-  return { type: "standard_attention", implementation: $("#flash-attention").checked ? "flash_attention" : "standard", query_heads: numberValue("query-heads"), kv_heads: numberValue("kv-heads"), head_dim: numberValue("head-dim"), query_width_equals_hidden: $("#query-width-mode").value === "hidden" };
+  if (type === "csa_attention" || type === "hca_attention") return compressedAttentionSpec(type);
+  return { type: "standard_attention", implementation: $("#flash-attention").checked ? "flash_attention" : "standard", query_heads: numberValue("query-heads"), kv_heads: numberValue("kv-heads"), head_dim: numberValue("head-dim"), query_width_equals_hidden: $("#query-width-mode").value === "hidden", sliding_window: numberValue("attention-sliding-window"), q_lora_rank: numberValue("attention-q-lora-rank"), o_lora_rank: numberValue("attention-o-lora-rank"), weight_dtype: $("#attention-weight-dtype").value };
 }
 
 function unmodeledSpec() {
@@ -202,18 +256,26 @@ function unmodeledSpec() {
   };
 }
 
+function residualSpec(type) {
+  if (type === "unmodeled") return unmodeledSpec();
+  if (type === "attnres") return { type: "attnres", block_count: numberValue("attnres-blocks") };
+  if (type === "mhc") return { type: "mhc", channels: numberValue("mhc-channels"), sinkhorn_iters: numberValue("mhc-sinkhorn-iters") };
+  return { type: "standard_residual" };
+}
+
 function modelSpec() {
   const pattern = readPatternRows().map((row) => ({
     repeat: row.repeat,
     norm: row.norm === "unmodeled" ? unmodeledSpec() : { type: row.norm },
     attention: attentionSpec(row.attention),
-    residual: row.residual === "unmodeled" ? unmodeledSpec() : (row.residual === "attnres" ? { type: "attnres", block_count: numberValue("attnres-blocks") } : { type: "standard_residual" }),
+    residual: residualSpec(row.residual),
     ffn: ffnSpec(row.ffn),
   }));
   return {
     id: modelIdentity.id, name: modelIdentity.name,
     dimensions: { layer_count: numberValue("layer-count"), hidden_size: numberValue("hidden-size"), intermediate_size: numberValue("intermediate-size"), vocab_size: numberValue("vocab-size"), padded_vocab_size: numberValue("padded-vocab-size") },
     embedding: { type: "token_embedding", tied_lm_head: $("#tied-lm-head").checked }, layer_pattern: pattern,
+    ...(modelLayerPrefix.length ? { layer_prefix: JSON.parse(JSON.stringify(modelLayerPrefix)) } : {}),
     output: { norm: { type: "rms_norm" }, head: { type: "lm_head" }, sampling: { type: "sampling" } },
     dtype: { weight: $("#weight-dtype").value, activation: $("#activation-dtype").value, kv_cache: $("#kv-dtype").value, state: $("#kda-state-dtype").value, accumulation: $("#accumulation-dtype").value, logits: $("#logits-dtype").value },
     quantization: { block_size: numberValue("quant-block-size"), scale_bytes: numberValue("quant-scale-bytes") },
