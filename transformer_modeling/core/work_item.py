@@ -77,6 +77,7 @@ class WorkItem:
     kernel_count: int
     logical_ops: float | None = None
     gemm_shape: tuple[int, int, int] | None = None
+    compute_dtype: str | None = None
 
 
 def _gemm(
@@ -89,6 +90,7 @@ def _gemm(
     output_bytes: float, #输出矩阵每个元素占多少字节
     repeats: int,
     output_elements: int | None = None,
+    compute_dtype: str | None = None,
 ) -> WorkItem:
     ops = 2 * m * k * n * repeats  #计算矩阵运算量
     output_elements = m * n if output_elements is None else output_elements #输出矩阵元素个数
@@ -102,4 +104,5 @@ def _gemm(
         hbm_payload_bytes=traffic, #存访存量
         kernel_count=repeats,
         gemm_shape=(m, n, k),
+        compute_dtype=compute_dtype,
     )

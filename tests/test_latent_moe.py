@@ -13,20 +13,24 @@ def latent_data(tp=1, ep=1):
 def equivalent_width(data):
     """去掉latent_size并换成hidden域等效宽度：7168×1536=3584×3072。"""
     result = copy.deepcopy(data)
-    for pattern in result["model"]["layer_pattern"]:
-        ffn = pattern["ffn"]
-        if ffn["type"] != "moe":
-            continue
-        ffn.pop("latent_size")
-        ffn["expert_intermediate_size"] = 1536
-        ffn["shared_expert_intermediate_size"] = 3072
+    for pattern in (
+        *result["model"].get("layer_prefix", []),
+        *result["model"]["layer_pattern"],
+        *result["model"].get("layer_suffix", []),
+    ):
+        for item in pattern["operations"]:
+            ffn = item["operator"]
+            if ffn["type"] != "moe":
+                continue
+            ffn.pop("latent_size")
+            ffn["expert_intermediate_size"] = 1536
+            ffn["shared_expert_intermediate_size"] = 1536
     return result
 
 
 class LatentMoETests(unittest.TestCase):
     def test_latent_projection_parameters_added(self):
         data = latent_data()
-        data["model"]["extra"]["parameter_count"] = 0
         baseline = equivalent_width(data)
         with_latent = estimate(Config.from_dict(data), False)["model"]["parameters"]
         without = estimate(Config.from_dict(baseline), False)["model"]["parameters"]
@@ -51,9 +55,14 @@ class LatentMoETests(unittest.TestCase):
 
     def test_latent_size_must_divide_tp(self):
         data = latent_data(tp=32)
-        for pattern in data["model"]["layer_pattern"]:
-            if pattern["ffn"]["type"] == "moe":
-                pattern["ffn"]["latent_size"] = 3600
+        for pattern in (
+            *data["model"].get("layer_prefix", []),
+            *data["model"]["layer_pattern"],
+            *data["model"].get("layer_suffix", []),
+        ):
+            for item in pattern["operations"]:
+                if item["operator"]["type"] == "moe":
+                    item["operator"]["latent_size"] = 3600
         with self.assertRaises(ValueError):
             estimate(Config.from_dict(data), False)
 

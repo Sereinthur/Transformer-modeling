@@ -9,7 +9,7 @@ from ..parallel.tensor import require_divisible, tp_all_reduce_hidden
 from .base import (
     OperatorEstimate, TransformerOperator, blocked_bytes, effective_element_bytes,
     gemm, int_param, local_kv_heads, optional_int, paged_kv_tokens,
-    resolve_weight_dtype, windowed_tokens,
+    resolve_kv_cache_dtype, resolve_weight_dtype, windowed_tokens,
 )
 
 SELECTORS = {"indexer", "uniform"}
@@ -48,6 +48,13 @@ class CompressedAttentionOperator(TransformerOperator):
         self._int(spec, "sliding_window")
         for field in ("q_lora_rank", "o_lora_rank"):
             optional_int(spec, field)
+        groups = int(spec.get("o_groups", 1))
+        if groups <= 0 or qh % groups:
+            raise ValueError(f"{self.type_id}.o_groups must divide query_heads")
+        if groups > 1 and groups % config.parallelism.tensor_parallel:
+            raise ValueError(
+                f"{self.type_id}.o_groups must be divisible by tensor_parallel"
+            )
         selector = self._selector(spec)
         if selector not in SELECTORS:
             choices = ", ".join(sorted(SELECTORS))
@@ -57,6 +64,7 @@ class CompressedAttentionOperator(TransformerOperator):
                 if self._int(spec, field) <= 0:
                     raise ValueError(f"{self.type_id}.{field} must be greater than zero")
         resolve_weight_dtype(config, spec)
+        resolve_kv_cache_dtype(config, spec)
 
     def estimate(self, spec, ctx):
         model, count, h = ctx.model, ctx.occurrence_count, ctx.model.hidden_size
@@ -66,14 +74,19 @@ class CompressedAttentionOperator(TransformerOperator):
         selected, window = self._int(spec, "selected_entries"), self._int(spec, "sliding_window")
         rope_dim = self._int(spec, "qk_rope_head_dim")
         qr, orank = optional_int(spec, "q_lora_rank"), optional_int(spec, "o_lora_rank")
+        groups = int(spec.get("o_groups", 1))
+        shared_kv = bool(spec.get("shared_kv_projection", True))
+        attention_sink = bool(spec.get("attention_sink", False))
         selector = self._selector(spec)
         idx_heads, idx_dim = self._int(spec, "indexer_heads"), self._int(spec, "indexer_head_dim")
         wdtype = resolve_weight_dtype(ctx.config, spec)
+        kv_dtype = resolve_kv_cache_dtype(ctx.config, spec)
         local_qh, local_kvh = qh // ctx.tp, local_kv_heads(kvh, ctx.tp)
         q, kv, rows = local_qh * dim, local_kvh * dim, ctx.rows
         entry, global_entry = overlap * kv, overlap * kvh * dim
+        cache_components = 1 if shared_kv else 2
         ba = effective_element_bytes(ctx.config, model.activation_dtype)
-        bkv = effective_element_bytes(ctx.config, model.kv_dtype)
+        bkv = effective_element_bytes(ctx.config, kv_dtype)
         local_idx = idx_heads // ctx.tp if idx_heads and idx_heads % ctx.tp == 0 else idx_heads
 
         items = []
@@ -83,7 +96,11 @@ class CompressedAttentionOperator(TransformerOperator):
         else:
             items.append(gemm("layers.csa_q_projection", rows, h, q, ctx, weight_dtype=wdtype))
         # Compressor：wkv与wgate合并成一次投影，再由门控池化写出压缩entry。
-        items.append(gemm("layers.csa_compress_kv", rows, h, 2 * entry, ctx, weight_dtype=wdtype))
+        # wkv与wgate各自产生coff×head_dim；写入cache的是共享K=V压缩向量。
+        items.append(gemm(
+            "layers.csa_compress_kv_gate", rows, h, 2 * entry,
+            ctx, weight_dtype=wdtype,
+        ))
         pool_ops = 5 * rows * entry * count
         items.append(WorkItem(
             "layers.csa_compress_pool", "vector", pool_ops,
@@ -95,10 +112,16 @@ class CompressedAttentionOperator(TransformerOperator):
         entries_avg = ceil(entries_total / 2) if ctx.phase == "prefill" else entries_total
         if selector == "indexer":
             items.append(gemm(
-                "layers.csa_indexer_q", rows, h, local_idx * idx_dim, ctx, weight_dtype=wdtype
+                "layers.csa_indexer_q", rows, qr or h,
+                local_idx * idx_dim, ctx, weight_dtype=wdtype
             ))
             items.append(gemm(
-                "layers.csa_indexer_key", rows, h, idx_dim, ctx, weight_dtype=wdtype
+                "layers.csa_indexer_weights", rows, h, local_idx,
+                ctx, weight_dtype=wdtype
+            ))
+            items.append(gemm(
+                "layers.csa_indexer_compress_kv_gate", rows, h, 4 * idx_dim,
+                ctx, weight_dtype=wdtype
             ))
             score_ops = 2 * rows * entries_avg * local_idx * idx_dim * count
             items.append(WorkItem(
@@ -122,8 +145,8 @@ class CompressedAttentionOperator(TransformerOperator):
         )
         items.append(WorkItem(
             "layers.csa_attention", "attention", attn_ops,
-            (2 * rows * q * ba + entries_read * 2 * entry * bkv
-             + 2 * ctx.batch_size * visible_window * kv * bkv) * count,
+            (2 * rows * q * ba + entries_read * cache_components * entry * bkv
+             + cache_components * ctx.batch_size * visible_window * kv * bkv) * count,
             count, attn_ops,
         ))
         if rope_dim and not ctx.config.execution.rope_kv_write_fused:
@@ -133,24 +156,44 @@ class CompressedAttentionOperator(TransformerOperator):
                 2 * rows * (local_qh + local_kvh) * rope_dim * ba * count, count, rope_ops,
             ))
         if orank:
+            local_groups = groups // ctx.tp if groups % ctx.tp == 0 else 1
             items.append(gemm("layers.csa_o_a", rows, q, orank, ctx, weight_dtype=wdtype))
-            items.append(gemm("layers.csa_o_b", rows, orank, h, ctx, weight_dtype=wdtype))
+            items.append(gemm(
+                "layers.csa_o_b", rows, local_groups * orank, h,
+                ctx, weight_dtype=wdtype,
+            ))
         else:
             items.append(gemm("layers.csa_o_projection", rows, q, h, ctx, weight_dtype=wdtype))
 
         # 低秩输入/输出侧与Compressor、Indexer-key在TP rank间复制，Q/O按头切分。
         q_global = h * qr + qr * qh * dim if qr else h * qh * dim
         q_local = h * qr + qr * q if qr else h * q
-        o_global = qh * dim * orank + orank * h if orank else qh * dim * h
-        o_local = q * orank + orank * h if orank else q * h
+        local_groups = groups // ctx.tp if groups % ctx.tp == 0 else 1
+        o_global = (
+            qh * dim * orank + groups * orank * h
+            if orank else qh * dim * h
+        )
+        o_local = q * orank + local_groups * orank * h if orank else q * h
         compress_global = h * 2 * global_entry + ratio * global_entry
         compress_local = h * 2 * entry + ratio * entry
         index_global = index_local = 0
         if selector == "indexer":
-            index_global = h * idx_heads * idx_dim + h * idx_dim + idx_heads
-            index_local = h * local_idx * idx_dim + h * idx_dim + local_idx
-        global_params = count * (q_global + o_global + compress_global + index_global)
-        local_params = count * (q_local + o_local + compress_local + index_local)
+            index_global = (
+                (qr or h) * idx_heads * idx_dim + h * idx_heads
+                + h * 4 * idx_dim + 2 * idx_dim * ratio
+            )
+            index_local = (
+                (qr or h) * local_idx * idx_dim + h * local_idx
+                + h * 4 * idx_dim + 2 * idx_dim * ratio
+            )
+        misc_global = (qr if qr else 0) + kvh * dim + (qh if attention_sink else 0)
+        misc_local = (qr if qr else 0) + kv + (local_qh if attention_sink else 0)
+        global_params = count * (
+            q_global + o_global + compress_global + index_global + misc_global
+        )
+        local_params = count * (
+            q_local + o_local + compress_local + index_local + misc_local
+        )
 
         stored = paged_kv_tokens(
             ctx.config,
@@ -159,17 +202,21 @@ class CompressedAttentionOperator(TransformerOperator):
         stored_entries = ceil(stored / ratio)
         state_breakdown = {
             "compressed_kv_cache_bytes": blocked_bytes(
-                ctx.config, ctx.batch_size * count * stored_entries * 2 * entry, model.kv_dtype
+                ctx.config,
+                ctx.batch_size * count * stored_entries * cache_components * entry,
+                kv_dtype,
             ),
             "sliding_window_kv_cache_bytes": blocked_bytes(
                 ctx.config,
-                ctx.batch_size * count * (windowed_tokens(stored, window) if window else 0) * 2 * kv,
-                model.kv_dtype,
+                ctx.batch_size * count
+                * (windowed_tokens(stored, window) if window else 0)
+                * cache_components * kv,
+                kv_dtype,
             ),
         }
         if selector == "indexer":
             state_breakdown["indexer_key_cache_bytes"] = blocked_bytes(
-                ctx.config, ctx.batch_size * count * stored_entries * idx_dim, model.kv_dtype
+                ctx.config, ctx.batch_size * count * stored_entries * idx_dim, kv_dtype
             )
         state = sum(state_breakdown.values())
         assumptions = [
@@ -177,6 +224,8 @@ class CompressedAttentionOperator(TransformerOperator):
             "Top-K命中数按当前可见entry的平均值取min(k, entries)。",
             "位置等距采样与Top-K选择的成本按同一量级计。",
             "Indexer的Hadamard变换与低精度量化按等效GEMM近似。",
+            "本地滑窗与压缩KV分支合并后执行稀疏Attention。",
+            "K与V共享单个MQA cache向量；输出采用分组低秩投影。",
         ]
         return OperatorEstimate(
             self.type_id, self.chinese_name, count, global_params, local_params,
@@ -203,5 +252,5 @@ class HCAOperator(CompressedAttentionOperator):
     type_id, chinese_name = "hca_attention", "HCA重度压缩注意力"
     defaults = dict(
         CompressedAttentionOperator.defaults,
-        compress_ratio=128, compress_overlap=1, selector="uniform", sliding_window=0,
+        compress_ratio=128, compress_overlap=1, selector="uniform", sliding_window=128,
     )

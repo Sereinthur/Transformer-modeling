@@ -1,6 +1,6 @@
 {
   "_说明": "Qwen3-30B-A3B MoE单芯片解析示例；全部专家权重常驻，未启用Expert Parallel。",
-  "schema_version": 2,
+  "schema_version": 3,
   "hardware": {
     "name": "example_100t_80g_accelerator",
     "device_count": 1,
@@ -46,29 +46,14 @@
     "layer_pattern": [
       {
         "repeat": 1,
-        "norm": {
-          "type": "rms_norm"
-        },
-        "attention": {
-          "type": "standard_attention",
-          "implementation": "flash_attention",
-          "query_heads": 32,
-          "kv_heads": 4,
-          "head_dim": 128,
-          "query_width_equals_hidden": false
-        },
-        "residual": {
-          "type": "standard_residual"
-        },
-        "ffn": {
-          "type": "moe",
-          "implementation": "standard_moe",
-          "expert_count": 128,
-          "experts_per_token": 8,
-          "expert_intermediate_size": 768,
-          "shared_expert_intermediate_size": 0,
-          "activation": "swiglu"
-        }
+        "operations": [
+          {"id": "norm_pre", "operator": {"type": "rms_norm"}},
+          {"id": "attention", "operator": {"type": "standard_attention", "implementation": "flash_attention", "query_heads": 32, "kv_heads": 4, "head_dim": 128, "query_width_equals_hidden": false}},
+          {"id": "residual_attention", "operator": {"type": "standard_residual"}},
+          {"id": "norm_post", "operator": {"type": "rms_norm"}},
+          {"id": "moe", "operator": {"type": "moe", "implementation": "standard_moe", "expert_count": 128, "experts_per_token": 8, "expert_intermediate_size": 768, "shared_expert_intermediate_size": 0, "activation": "swiglu"}},
+          {"id": "residual_moe", "operator": {"type": "standard_residual"}}
+        ]
       }
     ],
     "output": {

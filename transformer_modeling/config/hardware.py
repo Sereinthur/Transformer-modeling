@@ -92,6 +92,9 @@ class HardwareSpec:
     device_count: int = 1                                                 # 总芯片数量 = TP × EP × PP
     interconnect: InterconnectSpec = InterconnectSpec("ring", None, None)  # TP/EP集合通信与PP传输参数
 
+    peak_ops_by_dtype: dict[str, float] | None = None
+    measured_ops_by_dtype: dict[str, float] | None = None
+
     @classmethod
     def from_dict(cls, data: dict[str, Any], weight_dtype: str) -> "HardwareSpec":
         compute = data.get("compute", {})
@@ -104,9 +107,22 @@ class HardwareSpec:
         )
         peak = throughput.get(dtype_key)
         measured_peak = measured_throughput.get(dtype_key)
-        if peak is None and measured_peak is None and weight_dtype.lower() != "mxfp4":
-            raise ValueError(f"hardware.compute.throughput.{dtype_key} is required")
-
+        peak_by_dtype = {
+            key.removesuffix("_dense_ops_per_second"): float(value)
+            for key, value in throughput.items()
+            if key.endswith("_dense_ops_per_second") and value is not None
+        }
+        if throughput.get("mxfp4_mxfp8_ops_per_second") is not None:
+            shared = float(throughput["mxfp4_mxfp8_ops_per_second"])
+            peak_by_dtype.update({"mxfp4": shared, "mxfp8": shared})
+        measured_by_dtype = {
+            key.removesuffix("_dense_ops_per_second"): float(value)
+            for key, value in measured_throughput.items()
+            if key.endswith("_dense_ops_per_second") and value is not None
+        }
+        if measured_throughput.get("mxfp4_mxfp8_ops_per_second") is not None:
+            shared = float(measured_throughput["mxfp4_mxfp8_ops_per_second"])
+            measured_by_dtype.update({"mxfp4": shared, "mxfp8": shared})
         memory = data.get("device_memory", {})
         runtime = data.get("runtime", {})
         tile = compute.get("matrix_tile", {}) or {}
@@ -140,6 +156,8 @@ class HardwareSpec:
             ),
             device_count=int(data.get("device_count", 1)),
             interconnect=InterconnectSpec.from_dict(data.get("interconnect", {})),
+            peak_ops_by_dtype=peak_by_dtype,
+            measured_ops_by_dtype=measured_by_dtype,
         )
         # 进行参数检查
         if spec.peak_ops_per_second is not None:
@@ -166,14 +184,25 @@ class HardwareSpec:
                 _positive(f"hardware.compute.{name}", value)
         return spec
 
-    @property
-    def effective_compute_ops_per_second(self) -> float:
+    def effective_compute_ops_per_second(self, dtype: str | None = None) -> float:
         """用于成本模型的计算上限：优先采用用户提供的外部实测值。"""
 
-        value = self.measured_ops_per_second or self.peak_ops_per_second
+        value, _ = self.compute_throughput(dtype)
         if value is None:
             raise ValueError("当前硬件缺少所选计算格式的吞吐，无法估算性能")
         return value
+
+    def compute_throughput(self, dtype: str | None) -> tuple[float | None, str]:
+        """Return throughput and provenance for one WorkItem compute format."""
+        selected = (dtype or "").lower()
+        measured = (self.measured_ops_by_dtype or {}).get(selected)
+        if measured is not None:
+            return measured, "measured"
+        peak = (self.peak_ops_by_dtype or {}).get(selected)
+        if peak is not None:
+            return peak, "peak"
+        fallback = self.measured_ops_per_second or self.peak_ops_per_second
+        return fallback, "model_default_fallback" if fallback is not None else "missing"
 
     @property
     def performance_supported(self) -> bool:

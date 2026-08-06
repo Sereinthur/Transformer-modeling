@@ -1,4 +1,4 @@
-"""模型预设和Hugging Face config到固定槽位Schema的映射。"""
+"""模型预设和 Hugging Face config 到 Schema v3 有序算子列表的映射。"""
 
 from __future__ import annotations
 
@@ -36,7 +36,14 @@ def _hf_definition(config: dict[str, Any]) -> dict[str, Any]:
         "id": str(config.get("_name_or_path", "hf-custom")), "name": str(config.get("_name_or_path", "Hugging Face自定义模型")),
         "dimensions": {"layer_count": int(config["num_hidden_layers"]), "hidden_size": h, "intermediate_size": int(config["intermediate_size"]), "vocab_size": int(config["vocab_size"]), "padded_vocab_size": int(config.get("padded_vocab_size", config["vocab_size"]))},
         "embedding": {"type": "token_embedding", "tied_lm_head": bool(config.get("tie_word_embeddings", False))},
-        "layer_pattern": [{"repeat": 1, "norm": {"type": "rms_norm"}, "attention": {"type": "standard_attention", "implementation": "flash_attention", "query_heads": qh, "kv_heads": kvh, "head_dim": dim, "query_width_equals_hidden": qh * dim == h}, "residual": {"type": "standard_residual"}, "ffn": ffn}],
+        "layer_pattern": [{"repeat": 1, "operations": [
+            {"id": "rms_norm_1", "operator": {"type": "rms_norm"}},
+            {"id": "attention_1", "operator": {"type": "standard_attention", "implementation": "flash_attention", "query_heads": qh, "kv_heads": kvh, "head_dim": dim, "query_width_equals_hidden": qh * dim == h}},
+            {"id": "residual_1", "operator": {"type": "standard_residual"}},
+            {"id": "rms_norm_2", "operator": {"type": "rms_norm"}},
+            {"id": "ffn_1", "operator": ffn},
+            {"id": "residual_2", "operator": {"type": "standard_residual"}},
+        ]}],
         "output": {"norm": {"type": "rms_norm"}, "head": {"type": "lm_head"}, "sampling": {"type": "sampling"}},
         "dtype": {"weight": "bf16", "activation": "bf16", "kv_cache": "bf16", "state": "bf16", "accumulation": "fp32", "logits": "fp32"},
         "inference": {"prefill_logits_mode": "last_token"},

@@ -4,15 +4,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from .attention import GatedMLAOperator, KDAOperator, StandardAttentionOperator
+from .attention import KDAOperator, StandardAttentionOperator
 from .base import TransformerOperator
 from .compressed_attention import CSAOperator, HCAOperator
+from .dsa import DSAAttentionOperator
 from .ffn import DenseFFNOperator, GatedFFNOperator, MoEOperator
+from .mla import GatedMLAOperator
 from .standard import (
     AttnResOperator, LayerNormOperator, LMHeadOperator, MHCOperator,
     RMSNormOperator, SamplingOperator, StandardResidualOperator,
     TokenEmbeddingOperator, UnmodeledOperator,
 )
+from .window_attention import SlidingWindowAttentionOperator
 
 
 _OPERATORS: dict[str, TransformerOperator] = {}
@@ -27,7 +30,8 @@ def register(operator: TransformerOperator) -> None:
 for _operator in (
     TokenEmbeddingOperator(), RMSNormOperator(), LayerNormOperator(),
     StandardResidualOperator(), AttnResOperator(), MHCOperator(),
-    StandardAttentionOperator(), KDAOperator(), GatedMLAOperator(),
+    StandardAttentionOperator(), SlidingWindowAttentionOperator(),
+    KDAOperator(), GatedMLAOperator(), DSAAttentionOperator(),
     CSAOperator(), HCAOperator(), DenseFFNOperator(), GatedFFNOperator(),
     MoEOperator(), LMHeadOperator(), SamplingOperator(), UnmodeledOperator(),
 ):
@@ -43,7 +47,7 @@ def get_operator(type_id: str) -> TransformerOperator:
 
 def get_operator_catalog() -> dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "operators": [
             {
                 "type": operator.type_id,

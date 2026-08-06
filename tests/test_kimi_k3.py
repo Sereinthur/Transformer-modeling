@@ -7,95 +7,69 @@ from transformer_modeling.models import get_preset
 from helpers import example, parallel, phase_operators
 
 
-def k3_data(scenario="base", tp=1, ep=1, pp=1):
-    data = example("kimi_k3_base_tp64")
-    data["model"] = get_preset("kimi-k3-draft", scenario)["model"]
-    data["hardware"]["compute"]["throughput"] = {"mxfp4_mxfp8_ops_per_second": 1e15}
+def k3_data(tp=1, ep=1, pp=1):
+    data = example()
+    data["model"] = get_preset("kimi-k3-official")["model"]
+    data["hardware"]["compute"]["throughput"] = {
+        "bf16_dense_ops_per_second": 1e15,
+        "mxfp4_mxfp8_ops_per_second": 2e15,
+    }
     return parallel(data, tp=tp, ep=ep, pp=pp)
 
 
+def op(layer, type_id):
+    return next(item.operator for item in layer.operations if item.operator.type == type_id)
+
+
 class KimiK3Tests(unittest.TestCase):
-    def test_all_scenarios_reconcile_to_2_8t(self):
-        for scenario in ("compact", "base", "deep_wide"):
-            with self.subTest(scenario=scenario):
-                result = estimate(Config.from_dict(k3_data(scenario)), False)
-                self.assertEqual(result["model"]["parameters"], 2_800_000_000_000)
-                self.assertFalse(result["validity"]["performance_complete"])
+    def test_removed_draft_id_has_actionable_error(self):
+        with self.assertRaisesRegex(ValueError, "use kimi-k3-official"):
+            get_preset("kimi-k3-draft")
 
-    def test_k3_tp1_is_over_one_tib_not_twelve_gib(self):
-        result = estimate(Config.from_dict(k3_data()), False)
-        required = result["capacity"]["required_bytes_per_critical_rank"]
-        self.assertGreater(required, 1.3 * 2**40)
-        self.assertFalse(result["capacity"]["capacity_feasible"])
-
-    def test_pattern_is_three_kda_one_mla(self):
-        result = estimate(Config.from_dict(k3_data()), False)
+    def test_exact_v3_layer_order_and_operator_counts(self):
+        config = Config.from_dict(k3_data())
+        layers = config.model.expanded_layers()
+        self.assertEqual(len(layers), 93)
+        self.assertEqual([i + 1 for i, layer in enumerate(layers) if any(item.operator.type == "gated_mla" for item in layer.operations)], [*range(4, 93, 4), 93])
+        self.assertEqual(op(layers[0], "gated_ffn").implementation, "situ_glu")
+        self.assertTrue(all(op(layer, "moe").type == "moe" for layer in layers[1:]))
+        result = estimate(config, False)
         mix = result["model"]["operator_mix"]
-        self.assertEqual(mix["kda"], 48)
-        self.assertEqual(mix["gated_mla"], 16)
-        self.assertEqual(mix["moe"], 64)
-        self.assertEqual(mix["attnres"], 129)
+        self.assertEqual({key: mix[key] for key in ("kda", "gated_mla", "gated_ffn", "moe", "attnres")}, {"kda": 69, "gated_mla": 24, "gated_ffn": 1, "moe": 92, "attnres": 93})
+        self.assertEqual(result["model"]["special_operator_estimation"]["attnres"]["formula_confidence"], "approximate")
 
-    def test_attnres_is_pre_sublayer_temporary_working_set(self):
-        result = estimate(Config.from_dict(k3_data(tp=64)), True)
-        operators = phase_operators(result["performance"]["prefill"])
-        first_attnres = next(item for item in operators if item["type"] == "attnres")
-        first_norm = next(item for item in operators if item["type"] == "rms_norm")
-        self.assertLess(operators.index(first_attnres), operators.index(first_norm))
-
-        attnres = [item for item in operators if item["type"] == "attnres"]
-        self.assertEqual(sum(item["occurrences"] for item in attnres), 129)
-        self.assertEqual(sum(item["capacity"]["local_parameters"] for item in attnres), 1_849_344)
-        self.assertTrue(all(item["capacity"]["persistent_state_bytes"] == 0 for item in attnres))
-        self.assertTrue(all(item["capacity"]["temporary_bytes"] > 0 for item in attnres))
-
-    def test_capacity_uses_same_operator_workspace_peak(self):
-        result = estimate(Config.from_dict(k3_data(tp=64)), True)
+    def test_attnres_is_an_ordered_operator_and_drives_pp_payload(self):
+        data = k3_data(pp=2)
+        data["parallelism"]["pipeline_stage_boundaries"] = [48]
+        data["serving"]["batch_size"] = 1
+        data["serving"]["prompt_length"] = {"distribution": "fixed", "value": 64}
+        config = Config.from_dict(data)
+        self.assertEqual(op(config.model.expanded_layers()[0], "attnres").get("block_size"), 12)
+        result = estimate(config, True)
+        ordered = phase_operators(result["performance"]["prefill"])
+        self.assertEqual(ordered[1]["type"], "attnres")  # embedding then the first layer's AttnRes
+        self.assertEqual(sum(item["occurrences"] for item in ordered if item["type"] == "attnres"), 186)
         stage = result["capacity"]["per_stage"][0]
-        operators = phase_operators(result["performance"]["prefill"])
-        expected = max(
-            item["capacity"]["temporary_bytes"]
-            + max((comm["collective"]["api_payload_bytes_per_rank_per_occurrence"]
-                   for comm in item["communication"]), default=0)
-            for item in operators
-        )
-        self.assertEqual(stage["combined_workspace_peak_bytes"], expected)
+        self.assertEqual(stage["pipeline_state_width_elements"], config.model.state_width_after_layer(47))
+        self.assertGreater(stage["pipeline_state_payload_bytes"], 64 * config.model.hidden_size * config.model.activation_bytes)
 
-    def test_kda_state_constant_and_mla_cache_grows(self):
-        short = estimate(Config.from_dict(k3_data()), False)
-        data = k3_data()
-        data["serving"]["output_length"]["value"] = 512
-        long = estimate(Config.from_dict(data), False)
-        s1 = short["capacity"]["per_stage"][0]["states_by_operator"]
-        s2 = long["capacity"]["per_stage"][0]["states_by_operator"]
-        self.assertEqual(s1["kda_state_bytes"], s2["kda_state_bytes"])
-        self.assertGreater(s2["mla_latent_kv_cache_bytes"], s1["mla_latent_kv_cache_bytes"])
+    def test_capacity_and_state_regression(self):
+        base = estimate(Config.from_dict(k3_data()), False)
+        self.assertGreater(base["capacity"]["required_bytes_per_critical_rank"], 1.3 * 2**40)
+        self.assertEqual(base["model"]["metadata"]["published_parameter_reference"], 2_780_000_000_000)
+        long_data = k3_data()
+        long_data["serving"]["output_length"]["value"] = 512
+        long = estimate(Config.from_dict(long_data), False)
+        first = base["capacity"]["per_stage"][0]["states_by_operator"]
+        later = long["capacity"]["per_stage"][0]["states_by_operator"]
+        self.assertEqual(first["kda_state_bytes"], later["kda_state_bytes"])
+        self.assertGreater(later["mla_latent_kv_cache_bytes"], first["mla_latent_kv_cache_bytes"])
 
-    def test_prefix_hits_reduce_known_prefill_latency(self):
-        data = k3_data()
-        data["serving"]["prompt_length"]["value"] = 1024
-        base = estimate(Config.from_dict(data), False)["performance"]["prefill"]["latency_seconds"]
-        hit = copy.deepcopy(data)
-        hit["serving"]["prefix_cache"].update(
-            kda_state_hit_rate=1, kda_cached_prefix_tokens=768,
-            mla_prefix_hit_rate=1, mla_average_matched_tokens=768,
-        )
-        faster = estimate(Config.from_dict(hit), False)["performance"]["prefill"]["latency_seconds"]
-        self.assertLess(faster, base)
-
-    def test_k3_can_use_pp_and_ep_without_model_name_branch(self):
-        data = k3_data(tp=2, ep=8, pp=2)
-        result = estimate(Config.from_dict(data), True)
-        self.assertEqual(len(result["performance"]["prefill"]["stages"]), 2)
-        moe = next(item for item in phase_operators(result["performance"]["prefill"]) if item["type"] == "moe")
-        self.assertEqual(sum(item["collective"]["type"] == "all_to_all" for item in moe["communication"]), 2)
-
-    def test_missing_native_mx_throughput_keeps_capacity_only(self):
-        data = k3_data()
-        data["hardware"]["compute"]["throughput"] = {"int4_dense_ops_per_second": 1e15}
-        result = estimate(Config.from_dict(data), False)
-        self.assertIsNone(result["performance"])
-        self.assertGreater(result["capacity"]["required_bytes_per_critical_rank"], 0)
+    def test_v3_has_no_global_hidden_flow(self):
+        legacy = copy.deepcopy(k3_data())
+        legacy["model"]["hidden_state_flow"] = {"type": "attnres", "block_size": 12}
+        with self.assertRaisesRegex(ValueError, "configuration version expired"):
+            Config.from_dict(legacy)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 {
   "_说明": "4芯片Tensor Parallel GQA示例；单一同构Ring互联域。",
-  "schema_version": 2,
+  "schema_version": 3,
   "hardware": {
     "name": "example_4x100t_80g_ring",
     "device_count": 4,
@@ -46,25 +46,14 @@
     "layer_pattern": [
       {
         "repeat": 1,
-        "norm": {
-          "type": "rms_norm"
-        },
-        "attention": {
-          "type": "standard_attention",
-          "implementation": "flash_attention",
-          "query_heads": 32,
-          "kv_heads": 8,
-          "head_dim": 128,
-          "query_width_equals_hidden": true
-        },
-        "residual": {
-          "type": "standard_residual"
-        },
-        "ffn": {
-          "type": "gated_ffn",
-          "implementation": "swiglu",
-          "intermediate_size": 11008
-        }
+        "operations": [
+          {"id": "norm_pre", "operator": {"type": "rms_norm"}},
+          {"id": "attention", "operator": {"type": "standard_attention", "implementation": "flash_attention", "query_heads": 32, "kv_heads": 8, "head_dim": 128, "query_width_equals_hidden": true}},
+          {"id": "residual_attention", "operator": {"type": "standard_residual"}},
+          {"id": "norm_post", "operator": {"type": "rms_norm"}},
+          {"id": "ffn", "operator": {"type": "gated_ffn", "implementation": "swiglu", "intermediate_size": 11008}},
+          {"id": "residual_ffn", "operator": {"type": "standard_residual"}}
+        ]
       }
     ],
     "output": {

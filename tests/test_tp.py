@@ -56,9 +56,36 @@ class TensorParallelTests(unittest.TestCase):
                 attention = next(item for item in phase_operators(result["performance"]["prefill"]) if item["type"] == "standard_attention")
                 self.assertEqual(attention["communication"][0]["collective"]["topology"], topology)
 
+    def test_explicit_mesh_dimensions_change_communication_cost(self):
+        data = parallel(example(), tp=4)
+        data["hardware"]["interconnect"].update(topology="mesh", mesh_rows=1, mesh_columns=4)
+        line = estimate(Config.from_dict(data), True)
+        data["hardware"]["interconnect"].update(mesh_rows=2, mesh_columns=2)
+        square = estimate(Config.from_dict(data), True)
+        line_attention = next(
+            item for item in phase_operators(line["performance"]["prefill"])
+            if item["type"] == "standard_attention"
+        )
+        square_attention = next(
+            item for item in phase_operators(square["performance"]["prefill"])
+            if item["type"] == "standard_attention"
+        )
+        line_time = line_attention["communication"][0]["time_seconds"]["estimated"]
+        square_time = square_attention["communication"][0]["time_seconds"]["estimated"]
+        self.assertGreater(line_time, square_time)
+
+    def test_invalid_mesh_dimensions_are_rejected(self):
+        data = parallel(example(), tp=4)
+        data["hardware"]["interconnect"].update(topology="mesh", mesh_rows=2)
+        with self.assertRaisesRegex(ValueError, "provided together"):
+            Config.from_dict(data)
+        data["hardware"]["interconnect"]["mesh_columns"] = 3
+        with self.assertRaisesRegex(ValueError, "largest TP or EP group"):
+            Config.from_dict(data)
+
     def test_invalid_heads_and_vocab_are_rejected(self):
         heads = parallel(example(), tp=4)
-        heads["model"]["layer_pattern"][0]["attention"]["query_heads"] = 10
+        heads["model"]["layer_pattern"][0]["operations"][1]["operator"]["query_heads"] = 10
         with self.assertRaisesRegex(ValueError, "query_heads"):
             Config.from_dict(heads)
         vocab = parallel(example(), tp=4)

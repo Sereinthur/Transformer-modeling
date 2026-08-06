@@ -10,7 +10,7 @@ from .base import (
     OperatorContext, OperatorEstimate,
     TransformerOperator, blocked_bytes, effective_element_bytes,
     gemm, int_param, local_kv_heads, optional_int, paged_kv_tokens,
-    resolve_weight_dtype, windowed_pairs, windowed_tokens,
+    resolve_kv_cache_dtype, resolve_weight_dtype, windowed_pairs, windowed_tokens,
 )
 
 
@@ -33,7 +33,13 @@ class StandardAttentionOperator(TransformerOperator):
             raise ValueError("standard_attention query_heads * head_dim must equal hidden_size")
         for field in ("sliding_window", "q_lora_rank", "o_lora_rank"):
             optional_int(spec, field)
+        groups = int(spec.get("o_groups", 1))
+        if groups <= 0 or qh % groups:
+            raise ValueError("standard_attention o_groups must divide query_heads")
+        if groups > 1 and groups % tp:
+            raise ValueError("standard_attention o_groups must be divisible by tensor_parallel")
         resolve_weight_dtype(config, spec)
+        resolve_kv_cache_dtype(config, spec)
 
     def estimate(self, spec, ctx):
         model, count = ctx.model, ctx.occurrence_count
@@ -42,32 +48,61 @@ class StandardAttentionOperator(TransformerOperator):
         dim = int_param(spec, "head_dim")
         window = optional_int(spec, "sliding_window")
         qr, orank = optional_int(spec, "q_lora_rank"), optional_int(spec, "o_lora_rank")
+        groups = int(spec.get("o_groups", 1))
+        shared_kv = bool(spec.get("shared_kv_projection", False))
+        attention_sink = bool(spec.get("attention_sink", False))
         wdtype = resolve_weight_dtype(ctx.config, spec)
+        kv_dtype = resolve_kv_cache_dtype(ctx.config, spec)
         local_qh, local_kvh = qh // ctx.tp, local_kv_heads(kvh, ctx.tp)
         q, kv, h, rows = local_qh * dim, local_kvh * dim, model.hidden_size, ctx.rows
         ba = effective_element_bytes(ctx.config, model.activation_dtype)
-        bkv = effective_element_bytes(ctx.config, model.kv_dtype)
+        bkv = effective_element_bytes(ctx.config, kv_dtype)
         global_q, global_kv = qh * dim, kvh * dim
         # 低秩时输入侧（h×qr）与输出侧（orank×h）权重在TP rank间复制，与MLA一致。
         q_global = h * qr + qr * global_q if qr else h * global_q
         q_local = h * qr + qr * q if qr else h * q
-        o_global = global_q * orank + orank * h if orank else global_q * h
-        o_local = q * orank + orank * h if orank else q * h
-        global_params = count * (q_global + 2 * h * global_kv + o_global)
-        local_params = count * (q_local + 2 * h * kv + o_local)
+        local_groups = groups // ctx.tp if groups % ctx.tp == 0 else 1
+        o_global = (
+            global_q * orank + groups * orank * h if orank else global_q * h
+        )
+        o_local = q * orank + local_groups * orank * h if orank else q * h
+        kv_paths = 1 if shared_kv else 2
+        norms_and_sink = (
+            (qr if qr else 0) + (global_kv if shared_kv else 0)
+            + (qh if attention_sink else 0)
+        )
+        local_norms_and_sink = (
+            (qr if qr else 0) + (kv if shared_kv else 0)
+            + (local_qh if attention_sink else 0)
+        )
+        global_params = count * (
+            q_global + kv_paths * h * global_kv + o_global + norms_and_sink
+        )
+        local_params = count * (
+            q_local + kv_paths * h * kv + o_local + local_norms_and_sink
+        )
 
         if qr:
             items = [
                 gemm("layers.attn_q_a", rows, h, qr, ctx, weight_dtype=wdtype),
                 gemm("layers.attn_q_b", rows, qr, q, ctx, weight_dtype=wdtype),
-                gemm("layers.attn_kv_projection", rows, h, 2 * kv, ctx, weight_dtype=wdtype),
+                gemm(
+                    "layers.attn_kv_projection", rows, h, kv_paths * kv,
+                    ctx, weight_dtype=wdtype,
+                ),
             ]
         else:
-            items = [gemm("layers.qkv_projection", rows, h, q + 2 * kv, ctx, weight_dtype=wdtype)]
+            items = [gemm(
+                "layers.qkv_projection", rows, h, q + kv_paths * kv,
+                ctx, weight_dtype=wdtype,
+            )]
         if orank:
             output = [
                 gemm("layers.attn_o_a", rows, q, orank, ctx, weight_dtype=wdtype),
-                gemm("layers.attn_o_b", rows, orank, h, ctx, weight_dtype=wdtype),
+                gemm(
+                    "layers.attn_o_b", rows, local_groups * orank, h,
+                    ctx, weight_dtype=wdtype,
+                ),
             ]
         else:
             output = [gemm("layers.attention_output_projection", rows, q, h, ctx, weight_dtype=wdtype)]
@@ -89,7 +124,7 @@ class StandardAttentionOperator(TransformerOperator):
             logical = executed = 4 * ctx.batch_size * q * visible * count
             cache_tokens = visible
         attention_bytes = (
-            rows * q * ba + 2 * ctx.batch_size * cache_tokens * kv * bkv
+            rows * q * ba + kv_paths * ctx.batch_size * cache_tokens * kv * bkv
             + rows * q * ba
         ) * count
         if not flash and ctx.phase == "prefill":
@@ -106,7 +141,7 @@ class StandardAttentionOperator(TransformerOperator):
             rope_ops = 3 * rows * (q + kv) * count
             items.insert(len(items) - 1, WorkItem(
                 "layers.rope_kv_write", "vector", rope_ops,
-                (2 * rows * (q + kv) * ba + rows * 2 * kv * bkv) * count,
+                (2 * rows * (q + kv) * ba + rows * kv_paths * kv * bkv) * count,
                 count, rope_ops,
             ))
         items.extend(output)
@@ -119,8 +154,8 @@ class StandardAttentionOperator(TransformerOperator):
         )
         state = blocked_bytes(
             ctx.config,
-            ctx.batch_size * count * stored_tokens * 2 * kv,
-            model.kv_dtype,
+            ctx.batch_size * count * stored_tokens * kv_paths * kv,
+            kv_dtype,
         )
         temp = ceil(max(rows * (q + 2 * kv) * ba, rows * h * ba))
         assumptions = ["KV Head按均匀分片或等组复制放置。"]
@@ -128,6 +163,10 @@ class StandardAttentionOperator(TransformerOperator):
             assumptions.append(
                 f"滑窗{window} token：KV cache、注意力对数与读量均按窗口上限截断。"
             )
+        if shared_kv:
+            assumptions.append("K与V共享单个MQA投影和cache向量。")
+        if groups > 1:
+            assumptions.append(f"输出投影按{groups}组执行低秩wo_a，再由wo_b合并。")
         return OperatorEstimate(
             self.type_id, self.chinese_name, count, global_params, local_params,
             {"attention_parameters": local_params}, state,
@@ -205,75 +244,4 @@ class KDAOperator(TransformerOperator):
             ceil(rows * projected * ba), [projection, gate, conv, recurrence, output],
             tp_all_reduce_hidden(local_ctx, "kda_attention"),
             ["KDA Prefill按Chunkwise Scan、Decode按固定recurrent state近似。"], "low",
-        )
-
-
-class GatedMLAOperator(TransformerOperator):
-    type_id, chinese_name, slot = "gated_mla", "Gated MLA", "attention"
-    implementations = {"default", "latent_cache"}
-
-    def validate(self, spec, config):
-        super().validate(spec, config)
-        heads = int_param(spec, "query_heads")
-        require_divisible("gated_mla query_heads", heads, config.parallelism.tensor_parallel)
-        for field in ("q_lora_rank", "kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim"):
-            int_param(spec, field)
-
-    def estimate(self, spec, ctx):
-        model, count, h = ctx.model, ctx.occurrence_count, ctx.model.hidden_size
-        heads_global = int_param(spec, "query_heads")
-        heads = heads_global // ctx.tp
-        qr, kr = int_param(spec, "q_lora_rank"), int_param(spec, "kv_lora_rank")
-        nope, rope = int_param(spec, "qk_nope_head_dim"), int_param(spec, "qk_rope_head_dim")
-        vd, dq = int_param(spec, "v_head_dim"), nope + rope
-        cache = ctx.config.serving.prefix_cache
-        length = ctx.token_length
-        if ctx.phase == "prefill":
-            saved = round(cache.mla_prefix_hit_rate * min(length, cache.mla_average_matched_tokens))
-            length = max(1, length - saved)
-        rows = ctx.batch_size * length
-        local_ctx = OperatorContext(ctx.config, ctx.phase, ctx.batch_size, length,
-                                    ctx.attention_length, count)
-        q_width_global = heads_global * dq
-        kv_width_global = heads_global * (nope + vd)
-        global_per = h * qr + qr * q_width_global + h * (kr + rope) + kr * kv_width_global + h * heads_global + heads_global * vd * h
-        replicated = h * (qr + kr + rope)
-        local_per = replicated + (global_per - replicated) // ctx.tp
-        ba = effective_element_bytes(ctx.config, model.activation_dtype)
-        bkv = effective_element_bytes(ctx.config, model.kv_dtype)
-        items = [
-            gemm("layers.mla_q_a", rows, h, qr, local_ctx),
-            gemm("layers.mla_q_b", rows, qr, heads * dq, local_ctx),
-            gemm("layers.mla_kv_a", rows, h, kr + rope, local_ctx, bkv),
-            gemm("layers.mla_kv_b", rows, kr, heads * (nope + vd), local_ctx),
-        ]
-        if ctx.phase == "prefill":
-            attn_ops = ctx.batch_size * heads * length * (length + 1) * (dq + vd)
-            cache_tokens = length
-        else:
-            attn_ops = 2 * ctx.batch_size * heads * ctx.attention_length * (dq + vd)
-            cache_tokens = ctx.attention_length
-        cache_read = ctx.batch_size * cache_tokens * (kr + rope) * bkv
-        items.append(WorkItem(
-            "layers.mla_attention", "attention", attn_ops * count,
-            (rows * heads * (dq + vd) * ba + cache_read) * count,
-            count, attn_ops * count,
-        ))
-        gate_ops = 6 * rows * heads * vd * count
-        items.append(WorkItem("layers.mla_gate", "vector", gate_ops,
-                              2 * rows * heads * vd * ba * count, count, gate_ops))
-        items.append(gemm("layers.mla_output", rows, heads * vd, h, local_ctx))
-        stored = paged_kv_tokens(
-            ctx.config,
-            ctx.config.serving.prompt_length + ctx.config.serving.output_length - 1,
-        )
-        state = blocked_bytes(
-            ctx.config, ctx.batch_size * count * stored * (kr + rope), model.kv_dtype
-        )
-        return OperatorEstimate(
-            self.type_id, self.chinese_name, count, global_per * count,
-            local_per * count, {"mla_parameters": local_per * count}, state,
-            {"mla_latent_kv_cache_bytes": state}, ceil(rows * max(qr, kr, heads * dq) * ba),
-            items, tp_all_reduce_hidden(local_ctx, "mla_attention"),
-            ["MLA latent cache在TP rank间复制。"], "low",
         )

@@ -1,11 +1,11 @@
-"""Schema v2顶层配置装配与跨字段校验。"""
+"""Schema v3 顶层配置装配与跨字段校验。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
-from .common import positive
+from .common import non_negative, positive
 from .deployment import DeploymentSpec
 from .execution import ExecutionSpec, ParallelSpec
 from .hardware import HardwareSpec
@@ -25,9 +25,16 @@ class Config:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Config":
+        if not isinstance(data, dict):
+            raise ValueError("configuration must be an object")
         version = int(data.get("schema_version", 0))
-        if version != 2:
-            raise ValueError(f"unsupported schema_version {version}; expected 2")
+        if version != 3:
+            if version in {1, 2}:
+                raise ValueError(
+                    f"configuration version expired: schema_version {version} is unsupported; "
+                    "use schema_version 3 with layer operations"
+                )
+            raise ValueError(f"unsupported schema_version {version}; expected 3")
         model_data = data.get("model", {})
         model = ModelSpec.from_dict(model_data)
         config = cls(
@@ -72,11 +79,12 @@ class Config:
         from ..operators import get_operator
 
         expected = [(self.model.embedding, "embedding")]
-        for layer in self.model.layer_pattern:
-            expected.extend((
-                (layer.norm, "norm"), (layer.attention, "attention"),
-                (layer.residual, "residual"), (layer.ffn, "ffn"),
-            ))
+        for layer in (
+            *self.model.layer_prefix,
+            *self.model.layer_pattern,
+            *self.model.layer_suffix,
+        ):
+            expected.extend((operation, "layer") for operation in layer.main_operators)
         expected.extend((
             (self.model.output.norm, "norm"),
             (self.model.output.head, "output"),
@@ -84,7 +92,10 @@ class Config:
         ))
         for spec, slot in expected:
             operator = get_operator(spec.type)
-            if operator.slot not in {"any", slot}:
+            allowed_slots = {"any", slot}
+            if slot == "layer":
+                allowed_slots |= {"norm", "attention", "ffn", "residual"}
+            if operator.slot not in allowed_slots:
                 raise ValueError(
                     f"operator {spec.type} belongs to {operator.slot}, not {slot} slot"
                 )
@@ -107,6 +118,28 @@ class Config:
             positive("interconnect effective bandwidth", bandwidth)
             if latency is None or latency < 0:
                 raise ValueError("interconnect collective latency must be non-negative")
+            if (interconnect.mesh_rows is None) != (interconnect.mesh_columns is None):
+                raise ValueError("mesh_rows and mesh_columns must be provided together")
+            if interconnect.mesh_rows is not None:
+                positive("interconnect mesh_rows", interconnect.mesh_rows)
+                positive("interconnect mesh_columns", interconnect.mesh_columns)
+                if tp > 1 and ep > 1 and tp != ep:
+                    raise ValueError(
+                        "explicit mesh dimensions require equal TP and EP group sizes"
+                    )
+                mesh_ranks = max(tp, ep)
+                if interconnect.mesh_rows * interconnect.mesh_columns != mesh_ranks:
+                    raise ValueError(
+                        "mesh_rows * mesh_columns must equal the largest TP or EP group size"
+                    )
+            pipeline_bandwidth = interconnect.effective_pipeline_bandwidth
+            pipeline_latency = interconnect.effective_pipeline_latency
+            if pipeline_bandwidth is None:
+                raise ValueError("pipeline effective bandwidth is required for parallel execution")
+            positive("pipeline effective bandwidth", pipeline_bandwidth)
+            if pipeline_latency is None:
+                raise ValueError("pipeline transfer latency is required for parallel execution")
+            non_negative("pipeline transfer latency", pipeline_latency)
         required = self.serving.prompt_length + self.serving.output_length - 1
         if self.serving.max_sequence_length and required > self.serving.max_sequence_length:
             raise ValueError("request exceeds max_sequence_length")

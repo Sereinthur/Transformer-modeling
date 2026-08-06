@@ -15,7 +15,9 @@ from .topologies import (
 
 
 def _all_to_all_profile(topology: str, payload: float, ranks: int,
-                        bandwidth: float, alpha: float) -> tuple[float, int, str, str]:
+                        bandwidth: float, alpha: float,
+                        mesh_rows: int | None = None,
+                        mesh_columns: int | None = None) -> tuple[float, int, str, str]:
     """S为每rank全部目标的API payload；返回关键rank解析时间。"""
 
     if ranks == 1:
@@ -39,7 +41,7 @@ def _all_to_all_profile(topology: str, payload: float, ranks: int,
             ranks - 1, "pairwise_exchange_all_to_all",
             "无阻塞Crossbar采用Pairwise Exchange。",
         )
-    rows, columns = mesh_dimensions(ranks)
+    rows, columns = mesh_dimensions(ranks, mesh_rows, mesh_columns)
     diameter = rows + columns - 2
     base = (ranks - 1) * alpha + remote / bandwidth
     return (
@@ -66,7 +68,8 @@ def collective_profile(config, request: CommunicationRequest) -> dict[str, Any]:
         assumption = "单rank无需集合通信。"
     elif request.kind == "all_to_all":
         seconds, steps, algorithm, assumption = _all_to_all_profile(
-            topology, payload, ranks, bandwidth, alpha
+            topology, payload, ranks, bandwidth, alpha,
+            interconnect.mesh_rows, interconnect.mesh_columns,
         )
         sent = received = (ranks - 1) / ranks * payload
     elif topology == "ring":
@@ -91,13 +94,15 @@ def collective_profile(config, request: CommunicationRequest) -> dict[str, Any]:
         sent = received = steps * payload if request.kind == "all_reduce" else (ranks - 1) * payload
         algorithm, assumption = f"recursive_doubling_{request.kind}", "无阻塞Crossbar近似。"
     else:
-        rows, columns = mesh_dimensions(ranks)
+        rows, columns = mesh_dimensions(
+            ranks, interconnect.mesh_rows, interconnect.mesh_columns
+        )
         function = mesh_all_reduce_seconds if request.kind == "all_reduce" else mesh_all_gather_seconds
         seconds = function(payload, ranks, bandwidth, alpha, rows, columns)
         diameter = rows + columns - 2
         sent = received = (diameter if request.kind == "all_reduce" else ranks - 1) * payload
         steps, algorithm = diameter, f"mesh_{request.kind}"
-        assumption = "自动近方形Mesh维度有序路由近似。"
+        assumption = "按配置或自动近方形Mesh进行维度有序路由近似。"
     total = seconds * request.occurrences
     return {
         "name": request.name,

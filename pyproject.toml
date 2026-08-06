@@ -14,6 +14,7 @@ dependencies = []
 
 [project.scripts]
 transformer-model = "transformer_modeling.cli:main"
+transformer-model-visual = "transformer_modeling.visual_app.server:main"
 
 [tool.setuptools.packages.find]
 include = ["transformer_modeling*"]

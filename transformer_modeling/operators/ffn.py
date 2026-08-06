@@ -23,14 +23,14 @@ class DenseFFNOperator(TransformerOperator):
 
     def validate(self, spec, config):
         super().validate(spec, config)
-        width = int(spec.get("intermediate_size", config.model.intermediate_size))
+        width = int(spec.get("intermediate_size", 0) or config.model.intermediate_size)
         if width <= 0:
             raise ValueError("dense_ffn intermediate_size must be positive")
         require_divisible("dense_ffn intermediate_size", width, config.parallelism.tensor_parallel)
 
     def estimate(self, spec, ctx):
         h, count = ctx.model.hidden_size, ctx.occurrence_count
-        width = int(spec.get("intermediate_size", ctx.model.intermediate_size))
+        width = int(spec.get("intermediate_size", 0) or ctx.model.intermediate_size)
         local = width // ctx.tp
         params = 2 * h * width * count
         local_params = 2 * h * local * count
@@ -53,26 +53,39 @@ class DenseFFNOperator(TransformerOperator):
 
 
 class GatedFFNOperator(TransformerOperator):
-    type_id, chinese_name, slot = "gated_ffn", "Gated/SwiGLU FFN", "ffn"
-    implementations = {"default", "swiglu", "fused_gate_up"}
+    type_id, chinese_name, slot = "gated_ffn", "Dense Gated FFN", "ffn"
+    implementations = {"default", "swiglu", "fused_gate_up", "situ_glu"}
 
     def validate(self, spec, config):
         super().validate(spec, config)
-        width = int(spec.get("intermediate_size", config.model.intermediate_size))
+        width = int(spec.get("intermediate_size", 0) or config.model.intermediate_size)
         if width <= 0 or width % config.parallelism.tensor_parallel:
             raise ValueError("gated_ffn intermediate_size must be positive and divisible by TP")
+        if spec.implementation == "situ_glu":
+            for field, default in (
+                ("activation_situ_beta", 4.0),
+                ("activation_situ_linear_beta", 25.0),
+                ("situ_ops_per_element", 6.0),
+            ):
+                if float(spec.get(field, default)) <= 0:
+                    raise ValueError(f"gated_ffn {field} must be positive")
 
     def estimate(self, spec, ctx):
         h, count = ctx.model.hidden_size, ctx.occurrence_count
-        width = int(spec.get("intermediate_size", ctx.model.intermediate_size))
+        width = int(spec.get("intermediate_size", 0) or ctx.model.intermediate_size)
         local = width // ctx.tp
         params, local_params = 3 * h * width * count, 3 * h * local * count
         gate_up = gemm("layers.ffn_gate_up", ctx.rows, h, 2 * local, ctx)
         down = gemm("layers.ffn_down", ctx.rows, local, h, ctx)
         ba = effective_element_bytes(ctx.config, ctx.model.activation_dtype)
-        ops = 8 * ctx.rows * local * count
+        ops_per_element = (
+            float(spec.get("situ_ops_per_element", 6.0))
+            if spec.implementation == "situ_glu" else 8.0
+        )
+        ops = int(ops_per_element * ctx.rows * local * count)
         activation = WorkItem(
-            "layers.ffn_swiglu", "vector", ops,
+            "layers.ffn_situ_glu" if spec.implementation == "situ_glu" else "layers.ffn_swiglu",
+            "vector", ops,
             3 * ctx.rows * local * ba * count, count, ops,
         )
         temp_factor = 1 if (
@@ -120,6 +133,8 @@ class MoEOperator(TransformerOperator):
         if str(spec.get("gate_activation", "softmax")).lower() not in GATE_OPS:
             choices = ", ".join(sorted(GATE_OPS))
             raise ValueError(f"moe gate_activation must be one of: {choices}")
+        if float(spec.get("swiglu_limit", 0.0)) < 0:
+            raise ValueError("moe swiglu_limit cannot be negative")
         for field in ("weight_dtype", "routed_expert_weight_dtype", "shared_expert_weight_dtype"):
             resolve_weight_dtype(config, spec, field)
 
@@ -137,7 +152,9 @@ class MoEOperator(TransformerOperator):
         wdtype = resolve_weight_dtype(ctx.config, spec)
         rdtype = resolve_weight_dtype(ctx.config, spec, "routed_expert_weight_dtype", wdtype)
         sdtype = resolve_weight_dtype(ctx.config, spec, "shared_expert_weight_dtype", wdtype)
-        gated = str(spec.get("activation", "swiglu")).lower() in {"swiglu", "gated"}
+        gated = str(spec.get("activation", "swiglu")).lower() in {
+            "swiglu", "gated", "situ",
+        }
         factor = 3 if gated else 2
         io = latent or h  # 专家I/O维：LatentMoE在latent域计算，否则为hidden。
         local_experts, local_width = experts // ctx.ep, width // ctx.tp
@@ -157,8 +174,15 @@ class MoEOperator(TransformerOperator):
         )
         ba = effective_element_bytes(ctx.config, model.activation_dtype)
         brw = effective_element_bytes(ctx.config, rdtype)
-        assignments = ctx.rows * topk
-        active_experts = min(local_experts, max(1, assignments))
+        global_assignments = ctx.rows * topk
+        active_ep_ranks = min(ctx.ep, ctx.batch_size)
+        # Dense backbone inputs are replicated across EP ranks.  Only routed
+        # expert work is divided after the idealized all-to-all dispatch.
+        assignments = ceil(global_assignments / active_ep_ranks)
+        global_active_experts = min(experts, max(1, global_assignments))
+        active_experts = min(
+            local_experts, max(1, ceil(global_active_experts / active_ep_ranks))
+        )
         # tile padding发生在每个专家内部的grouped GEMM上，
         # 用平均每专家行数作为效率口径，而不是所有专家的总行数。
         per_expert_rows = max(1, ceil(assignments / active_experts))
@@ -166,11 +190,11 @@ class MoEOperator(TransformerOperator):
         if routing == "hash":
             # Hash路由无可学习打分：只做token到专家的确定映射与分派。
             route_ops = 3 * ctx.rows * topk * count
-            route_bytes = assignments * io * ba * count
+            route_bytes = global_assignments * io * ba * count
         else:
             route_ops = gate_const * ctx.rows * experts * count
             route_bytes = (
-                ctx.rows * experts * model.logits_bytes + assignments * io * ba
+                ctx.rows * experts * model.logits_bytes + global_assignments * io * ba
             ) * count
         route = WorkItem(
             "layers.moe_topk_dispatch", "vector", route_ops, route_bytes, count, route_ops,
@@ -183,7 +207,7 @@ class MoEOperator(TransformerOperator):
         ) * count
         first = WorkItem(
             "layers.moe_expert_gate_up", "gemm", first_ops, first_bytes, count,
-            first_ops, (per_expert_rows, first_n, io),
+            first_ops, (per_expert_rows, first_n, io), compute_dtype=rdtype,
         )
         down_ops = 2 * assignments * local_width * io * count
         down_bytes = (
@@ -192,7 +216,7 @@ class MoEOperator(TransformerOperator):
         ) * count
         down = WorkItem(
             "layers.moe_expert_down", "gemm", down_ops, down_bytes, count,
-            down_ops, (per_expert_rows, io, local_width),
+            down_ops, (per_expert_rows, io, local_width), compute_dtype=rdtype,
         )
         combine_ops = 3 * assignments * io * count
         combine = WorkItem(
@@ -200,6 +224,15 @@ class MoEOperator(TransformerOperator):
             2 * assignments * io * ba * count, count, combine_ops,
         )
         items = [route, first, down, combine]
+        if gated:
+            limit = float(spec.get("swiglu_limit", 0.0))
+            activation_ops = (10 if limit > 0 else 8) * assignments * local_width * count
+            items.insert(2, WorkItem(
+                "layers.moe_clipped_swiglu" if limit > 0 else "layers.moe_swiglu",
+                "vector", activation_ops,
+                2 * assignments * local_width * ba * count,
+                count, activation_ops,
+            ))
         if routing != "hash":
             items.insert(0, gemm(
                 "layers.moe_router", ctx.rows, h, experts, ctx, model.logits_bytes,
@@ -229,7 +262,7 @@ class MoEOperator(TransformerOperator):
 
         comm = tp_all_reduce_hidden(ctx, "moe")
         if ctx.ep > 1:
-            payload = ctx.rows * topk * io * ba
+            payload = global_assignments * io * ba
             comm.extend((
                 CommunicationRequest("layers.moe_dispatch_all_to_all", "专家Dispatch", "all_to_all", "ep", payload, count),
                 CommunicationRequest("layers.moe_combine_all_to_all", "专家Combine", "all_to_all", "ep", payload, count),
@@ -244,6 +277,12 @@ class MoEOperator(TransformerOperator):
             assumptions.append("Hash路由不含可学习打分权重，分派按确定映射计成本。")
         if spec.get("routed_scaling_factor") is not None:
             assumptions.append("routed_scaling_factor只缩放权重数值，不产生额外计算或访存。")
+        limit = float(spec.get("swiglu_limit", 0.0))
+        if limit > 0:
+            assumptions.append(f"SwiGLU的gate/up按官方上限{limit:g}执行clamp。")
+        hash_state = (
+            ctx.model.vocab_size * topk * 4 * count if routing == "hash" else 0
+        )
         buckets = {}
         for dtype, value in (
             (rdtype, local_expert_params * count),
@@ -259,7 +298,10 @@ class MoEOperator(TransformerOperator):
                 "shared_expert_parameters": local_shared_params * count,
                 "router_parameters": local_router_params * count,
                 "latent_projection_parameters": local_latent_params * count,
-            }, temporary_bytes=temp, work_items=items, communication_requests=comm,
+            }, persistent_state_bytes=hash_state,
+            state_breakdown=(
+                {"hash_route_table_bytes": hash_state} if hash_state else {}
+            ), temporary_bytes=temp, work_items=items, communication_requests=comm,
             assumptions=assumptions, confidence="medium",
             local_parameters_by_dtype=buckets,
         )

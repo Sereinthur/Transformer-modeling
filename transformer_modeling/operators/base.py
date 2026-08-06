@@ -53,6 +53,8 @@ class OperatorContext:
     token_length: int
     attention_length: int
     occurrence_count: int = 1
+    layer_start: int = 0
+    include_output: bool = False
 
     @property
     def rows(self) -> int:
@@ -190,6 +192,16 @@ def resolve_weight_dtype(
     return name
 
 
+def resolve_kv_cache_dtype(config: "Config", spec: "OperatorSpec") -> str:
+    """Return the operator override, or inherit the model KV-cache format."""
+    value = spec.get("kv_cache_dtype")
+    if value is None or value == "":
+        return config.model.kv_dtype
+    name = str(value).lower()
+    dtype_bytes(name)
+    return name
+
+
 def windowed_tokens(tokens: int, window: int) -> int:
     """滑窗注意力下单个query实际可见的token数（window<=0表示全局）。"""
 
@@ -213,6 +225,8 @@ def gemm(
     model = ctx.model
     ba = effective_element_bytes(ctx.config, model.activation_dtype)
     bw = effective_element_bytes(ctx.config, weight_dtype or model.weight_dtype)
+    dtype = weight_dtype or model.weight_dtype
     return _gemm(
-        name, m, k, n, ba, bw, output_bytes or ba, ctx.occurrence_count
+        name, m, k, n, ba, bw, output_bytes or ba, ctx.occurrence_count,
+        compute_dtype=dtype,
     )

@@ -11,6 +11,7 @@ from ..parallel.tensor import (
 from .base import (
     OperatorContext, OperatorEstimate,
     TransformerOperator, blocked_bytes, effective_element_bytes, gemm,
+    resolve_weight_dtype,
 )
 
 
@@ -19,15 +20,41 @@ class TokenEmbeddingOperator(TransformerOperator):
 
     def validate(self, spec, config):
         super().validate(spec, config)
-        require_divisible(
-            "token_embedding padded_vocab_size",
-            config.model.padded_vocab_size, config.parallelism.tensor_parallel,
+        table_rows = int(spec.get("vocab_size", 0) or config.model.padded_vocab_size)
+        embedding_dim = int(spec.get("embedding_dim", 0) or config.model.hidden_size)
+        if table_rows <= 0:
+            raise ValueError("token_embedding.vocab_size must be greater than zero")
+        if embedding_dim != config.model.hidden_size:
+            raise ValueError(
+                "token_embedding.embedding_dim must equal model.dimensions.hidden_size; "
+                "insert an embedding projection before using a different width"
+            )
+        # Preserve the familiar error for inherited model dimensions while
+        # identifying an explicitly overridden embedding table precisely.
+        dimension_name = (
+            "token_embedding padded_vocab_size"
+            if not int(spec.get("vocab_size", 0) or 0)
+            else "token_embedding vocab_size"
         )
+        require_divisible(dimension_name, table_rows, config.parallelism.tensor_parallel)
+        weight_dtype = resolve_weight_dtype(config, spec)
+        if bool(spec.get("tied_lm_head", True)) and (
+            table_rows != config.model.padded_vocab_size
+            or embedding_dim != config.model.hidden_size
+            or weight_dtype != config.model.weight_dtype
+        ):
+            raise ValueError(
+                "a tied token_embedding must use the model padded_vocab_size, "
+                "hidden_size, and weight dtype"
+            )
 
     def estimate(self, spec, ctx):
         model, tp = ctx.model, ctx.tp
         tied = bool(spec.get("tied_lm_head", True))
-        global_params = model.padded_vocab_size * model.hidden_size
+        table_rows = int(spec.get("vocab_size", 0) or model.padded_vocab_size)
+        embedding_dim = int(spec.get("embedding_dim", 0) or model.hidden_size)
+        weight_dtype = resolve_weight_dtype(ctx.config, spec)
+        global_params = table_rows * embedding_dim
         local_params = ceil(global_params / tp)
         ba = effective_element_bytes(ctx.config, model.activation_dtype)
         work = WorkItem(
@@ -39,12 +66,23 @@ class TokenEmbeddingOperator(TransformerOperator):
             {"embedding_parameters": local_params},
             temporary_bytes=ceil(ctx.rows * model.hidden_size * ba),
             work_items=[work], communication_requests=tp_embedding_all_reduce(ctx),
-            assumptions=[f"LM Head权重共享={tied}", "词表并行Embedding输出在TP组内归约。"],
+            assumptions=[
+                f"LM Head权重共享={tied}",
+                f"Embedding表行数={table_rows}，输出宽度={embedding_dim}",
+                "词表并行Embedding输出在TP组内归约。",
+            ],
+            local_parameters_by_dtype={weight_dtype: local_params},
         )
 
 
 class NormOperator(TransformerOperator):
     slot = "norm"
+
+    def validate(self, spec, config):
+        super().validate(spec, config)
+        if float(spec.get("eps", 1e-6)) <= 0:
+            raise ValueError(f"{self.type_id}.eps must be greater than zero")
+        resolve_weight_dtype(config, spec)
 
     def estimate(self, spec, ctx):
         h, rows, count = ctx.model.hidden_size, ctx.rows, ctx.occurrence_count
@@ -60,10 +98,12 @@ class NormOperator(TransformerOperator):
             f"layers.{self.type_id}", "vector", ops_per * rows * h * count,
             traffic_factor * rows * h * ba * count, count,
         )
+        wdtype = resolve_weight_dtype(ctx.config, spec)
         return OperatorEstimate(
             self.type_id, self.chinese_name, count, h * count, h * count,
             {"norm_parameters": h * count},
             temporary_bytes=ceil(rows * h * ba), work_items=[item],
+            local_parameters_by_dtype={wdtype: h * count},
         )
 
 
@@ -91,52 +131,78 @@ class StandardResidualOperator(TransformerOperator):
 
 
 class AttnResOperator(TransformerOperator):
-    type_id, chinese_name, slot = "attnres", "AttnRes近似", "residual"
+    type_id, chinese_name, slot = "attnres", "AttnRes", "residual"
 
     def validate(self, spec, config):
         super().validate(spec, config)
-        blocks = int(spec.get("block_count", 8))
+        blocks = self._block_count(spec, config.model.layer_count)
         if blocks <= 0:
             raise ValueError("attnres.block_count must be greater than zero")
 
+    @staticmethod
+    def _block_count(spec, layer_count: int) -> int:
+        block_size = int(spec.get("block_size", 0))
+        explicit = spec.get("block_count")
+        if block_size < 0:
+            raise ValueError("attnres.block_size cannot be negative")
+        if block_size:
+            derived = ceil(layer_count / block_size)
+            if explicit is not None and int(explicit) != derived:
+                raise ValueError("attnres.block_count conflicts with layer_count/block_size")
+            return derived
+        return int(explicit if explicit is not None else 8)
+
     def estimate(self, spec, ctx):
-        blocks = int(spec.get("block_count", 8))
-        # 深度越深，可见的已完成block越多；工作量用平均可见数量，
-        # 临时空间则按最深处的全部block加当前partial block计算。
-        visible = (blocks + 1) / 2
-        peak_visible = blocks + 1
-        h, count = ctx.model.hidden_size, ctx.occurrence_count
+        blocks = self._block_count(spec, ctx.model.layer_count)
+        block_size = int(spec.get("block_size", 0))
+        if not block_size:
+            block_size = ceil(ctx.model.layer_count / blocks)
+        h, layer_count = ctx.model.hidden_size, ctx.occurrence_count
         ba = effective_element_bytes(ctx.config, ctx.model.activation_dtype)
-        # 每个AttnRes子层包含内部RMSNorm、pseudo-query打分、softmax和加权聚合。
-        ops = int((9 * ctx.rows * h * visible + 5 * ctx.rows * visible) * count)
-        # Block AttnRes two-phase近似按每子层5.5d的memory I/O计账，
-        # 避免把所有历史block在每层重复物化和读写。
-        traffic = int(5.5 * ctx.rows * h * ba * count)
+        calls: list[int] = []
+        for layer_index in range(ctx.layer_start, ctx.layer_start + layer_count):
+            banks_before = ceil(layer_index / block_size)
+            if banks_before:
+                calls.append(banks_before + 1)  # Attention前：bank + 当前prefix。
+            banks_for_mlp = layer_index // block_size + 1
+            calls.append(banks_for_mlp + 1)
+        if ctx.include_output:
+            calls.append(blocks + 1)
+        call_count = len(calls)
+        source_total = sum(calls)
+        peak_visible = max(calls, default=1)
+        # 每次聚合包含RMS归一化、pseudo-query打分、softmax和深度加权求和。
+        ops = int(9 * ctx.rows * h * source_total + 5 * ctx.rows * source_total)
+        traffic = int((2 * source_total + call_count) * ctx.rows * h * ba)
         temporary = blocked_bytes(
             ctx.config, ctx.rows * peak_visible * h, ctx.model.activation_dtype
         )
-        parameters = 2 * h * count  # learned pseudo-query + AttnRes内部RMSNorm
+        # 每层Attention/MLP各一组RMSNorm+projection，最终输出再一组。
+        parameters = 4 * h * layer_count + (2 * h if ctx.include_output else 0)
         return OperatorEstimate(
-            self.type_id, self.chinese_name, count,
+            self.type_id, self.chinese_name, call_count,
             global_parameters=parameters,
             local_parameters=parameters,
             parameter_breakdown={"attnres_parameters": parameters},
             persistent_state_bytes=0,
             state_breakdown={},
             temporary_bytes=temporary,
-            work_items=[WorkItem("layers.attnres", "vector", ops, traffic, count, ops)],
+            work_items=[WorkItem(
+                "layers.attnres", "vector", ops, traffic, call_count, ops
+            )],
             assumptions=[
-                "Block AttnRes在Attention/FFN前构造输入。",
+                f"按官方block_size={block_size}逐层计算可见bank，最终共有{blocks}个block。",
+                "首层Attention前bank为空，不执行聚合；FFN前与最终输出聚合按源码计入。",
                 "block representation属于单次前向临时空间，不作为跨token持久状态。",
-                "工作量按平均可见block数、流量按two-phase 5.5d/子层近似。",
-            ], confidence="low",
+                "聚合算术和HBM流量仍按等效向量操作估算。",
+            ], confidence="medium",
         )
 
 
 class MHCOperator(TransformerOperator):
     """mHC：n通道流形约束超连接，B*经Sinkhorn归一化后做通道混合。"""
 
-    type_id, chinese_name, slot = "mhc", "mHC流形约束超连接", "residual"
+    type_id, chinese_name, slot = "mhc", "mHC", "residual"
 
     def validate(self, spec, config):
         super().validate(spec, config)
@@ -144,32 +210,47 @@ class MHCOperator(TransformerOperator):
             raise ValueError("mhc.channels must be greater than zero")
         if int(spec.get("sinkhorn_iters", 20)) < 0:
             raise ValueError("mhc.sinkhorn_iters cannot be negative")
+        if float(spec.get("eps", 1e-6)) <= 0:
+            raise ValueError("mhc.eps must be greater than zero")
 
     def estimate(self, spec, ctx):
         channels = int(spec.get("channels", 4))
         iters = int(spec.get("sinkhorn_iters", 20))
         h, rows, count = ctx.model.hidden_size, ctx.rows, ctx.occurrence_count
         ba = effective_element_bytes(ctx.config, ctx.model.activation_dtype)
-        # B*·X通道混合 + A·X归并 + C广播回写，Sinkhorn迭代只作用于n×n矩阵。
-        ops = (
-            2 * rows * h * channels * channels
-            + 4 * rows * h * channels
-            + 4 * channels * channels * iters
-        ) * count
-        traffic = (2 * channels + 1) * rows * h * ba * count
-        parameters = 3 * channels * channels * count
+        mix_width = (2 + channels) * channels
+        hc_width = channels * h
+        # Each mHC operator card is one hc_pre -> sublayer -> hc_post wrapper.
+        # A DeepSeek-V4 block has two such cards: one after Attention and one
+        # after MoE.  Keeping the unit cost here prevents a visual split from
+        # silently doubling the old aggregate formula.
+        layer_parameters = mix_width * hc_width + mix_width + 3
+        head_parameters = channels * hc_width + channels + 1 if ctx.include_output else 0
+        parameters = layer_parameters * count + head_parameters
+        linear_ops = 2 * rows * hc_width * mix_width
+        pre_post_ops = 2 * rows * h * (channels + channels * channels + channels)
+        sinkhorn_ops = 4 * rows * channels * channels * max(1, iters)
+        ops = (linear_ops + pre_post_ops + sinkhorn_ops) * count
+        if ctx.include_output:
+            ops += 2 * rows * hc_width * channels + 2 * rows * h * channels
+        traffic = (3 * channels + channels * channels + 1) * rows * h * ba * count
+        occurrences = count + (1 if ctx.include_output else 0)
         return OperatorEstimate(
-            self.type_id, self.chinese_name, count,
+            self.type_id, self.chinese_name, occurrences,
             global_parameters=parameters,
             local_parameters=parameters,
             parameter_breakdown={"mhc_parameters": parameters},
             temporary_bytes=ceil(rows * h * channels * ba),
-            work_items=[WorkItem("layers.mhc", "vector", ops, traffic, count, ops)],
+            work_items=[WorkItem(
+                "layers.mhc", "vector", ops, traffic, occurrences, ops
+            )],
             assumptions=[
-                f"Sinkhorn {iters}次迭代融入残差混合kernel，不单独启动。",
+                "每个Attention和FFN均按hc_pre→子层→hc_post包裹。",
+                f"hc_fn按官方[(2+n)n,n*d]矩阵计参；Sinkhorn迭代数={iters}。",
                 "mHC中间激活按重计算处理，不作为持久状态缓存。",
-                f"{channels}通道残差流按峰值临时空间计入容量。",
-            ], confidence="low",
+                f"{channels}通道hidden state跨层和跨PP Stage持续传递。",
+            ], confidence="medium",
+            local_parameters_by_dtype={"fp32": parameters},
         )
 
 

@@ -1,6 +1,6 @@
 {
-  "_说明": "DeepSeek-V4-Pro参数化草案的1M上下文容量场景。硬件段沿用Kimi K3容量代理（B200 192GiB × NVL72，仅int4吞吐→容量-only）。61层=2×(滑窗Attention+Hash MoE) + 1×(CSA+Hash MoE) + 58×(HCA/CSA交替+MoE)，残差全部mHC 4通道；权重精度按组件区分：路由专家MXFP4、注意力与共享专家MXFP8。",
-  "schema_version": 2,
+  "_˵��": "DeepSeek-V4-Pro official text backbone proxy: 61 layers, 31 HCA + 30 CSA + 0 pure Sliding, with model-level four-channel mHC. MTP is shown but not estimated.",
+  "schema_version": 3,
   "hardware": {
     "name": "B200_192GiB_NVL72_capacity_proxy",
     "device_count": 72,
@@ -42,10 +42,10 @@
       "padded_vocab_size": 129280
     },
     "dtype": {
-      "weight": "mxfp4",
-      "activation": "mxfp8",
-      "kv_cache": "mxfp8",
-      "state": "mxfp8",
+      "weight": "fp8",
+      "activation": "fp8",
+      "kv_cache": "bf16",
+      "state": "bf16",
       "accumulation": "bf16",
       "logits": "fp32"
     },
@@ -53,7 +53,7 @@
       "prefill_logits_mode": "last_token"
     },
     "quantization": {
-      "block_size": 32,
+      "block_size": 128,
       "scale_bytes": 1
     },
     "embedding": {
@@ -63,177 +63,321 @@
     "layer_prefix": [
       {
         "repeat": 2,
-        "norm": {
-          "type": "rms_norm"
-        },
-        "attention": {
-          "query_heads": 128,
-          "kv_heads": 1,
-          "head_dim": 512,
-          "q_lora_rank": 1536,
-          "o_lora_rank": 1536,
-          "weight_dtype": "mxfp8",
-          "type": "standard_attention",
-          "implementation": "flash_attention",
-          "sliding_window": 128,
-          "query_width_equals_hidden": false
-        },
-        "residual": {
-          "type": "mhc",
-          "channels": 4,
-          "sinkhorn_iters": 20
-        },
-        "ffn": {
-          "type": "moe",
-          "implementation": "standard_moe",
-          "expert_count": 384,
-          "experts_per_token": 6,
-          "expert_intermediate_size": 3072,
-          "shared_expert_intermediate_size": 3072,
-          "shared_expert_count": 1,
-          "activation": "swiglu",
-          "gate_activation": "sqrtsoftplus",
-          "routed_scaling_factor": 1.5,
-          "routing": "hash",
-          "weight_dtype": "mxfp8",
-          "routed_expert_weight_dtype": "mxfp4",
-          "shared_expert_weight_dtype": "mxfp8"
-        }
+        "operations": [
+          {
+            "id": "rms_norm_1",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "hca_attention_1",
+            "operator": {
+              "query_heads": 128,
+              "kv_heads": 1,
+              "head_dim": 512,
+              "q_lora_rank": 1536,
+              "o_lora_rank": 1024,
+              "o_groups": 16,
+              "weight_dtype": "fp8",
+              "shared_kv_projection": true,
+              "attention_sink": true,
+              "qk_rope_head_dim": 64,
+              "kv_cache_dtype": "bf16",
+              "type": "hca_attention",
+              "implementation": "compressed_kv",
+              "compress_ratio": 128,
+              "compress_overlap": 1,
+              "selected_entries": 1024,
+              "sliding_window": 128,
+              "selector": "uniform"
+            }
+          },
+          {
+            "id": "mhc_attention_1",
+            "operator": {
+              "type": "mhc",
+              "channels": 4,
+              "sinkhorn_iters": 20,
+              "eps": 1e-06
+            }
+          },
+          {
+            "id": "rms_norm_2",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "moe_1",
+            "operator": {
+              "type": "moe",
+              "implementation": "standard_moe",
+              "expert_count": 384,
+              "experts_per_token": 6,
+              "expert_intermediate_size": 3072,
+              "shared_expert_intermediate_size": 3072,
+              "shared_expert_count": 1,
+              "activation": "swiglu",
+              "gate_activation": "sqrtsoftplus",
+              "swiglu_limit": 10.0,
+              "routed_scaling_factor": 2.5,
+              "routing": "hash",
+              "weight_dtype": "fp8",
+              "routed_expert_weight_dtype": "mxfp4",
+              "shared_expert_weight_dtype": "fp8"
+            }
+          },
+          {
+            "id": "mhc_moe_1",
+            "operator": {
+              "type": "mhc",
+              "channels": 4,
+              "sinkhorn_iters": 20,
+              "eps": 1e-06
+            }
+          }
+        ]
       },
       {
         "repeat": 1,
-        "norm": {
-          "type": "rms_norm"
-        },
-        "attention": {
-          "query_heads": 128,
-          "kv_heads": 1,
-          "head_dim": 512,
-          "q_lora_rank": 1536,
-          "o_lora_rank": 1536,
-          "weight_dtype": "mxfp8",
-          "type": "csa_attention",
-          "implementation": "compressed_kv",
-          "compress_ratio": 4,
-          "compress_overlap": 2,
-          "selected_entries": 1024,
-          "sliding_window": 128,
-          "selector": "indexer",
-          "indexer_heads": 128,
-          "indexer_head_dim": 128,
-          "qk_rope_head_dim": 64
-        },
-        "residual": {
-          "type": "mhc",
-          "channels": 4,
-          "sinkhorn_iters": 20
-        },
-        "ffn": {
-          "type": "moe",
-          "implementation": "standard_moe",
-          "expert_count": 384,
-          "experts_per_token": 6,
-          "expert_intermediate_size": 3072,
-          "shared_expert_intermediate_size": 3072,
-          "shared_expert_count": 1,
-          "activation": "swiglu",
-          "gate_activation": "sqrtsoftplus",
-          "routed_scaling_factor": 1.5,
-          "routing": "hash",
-          "weight_dtype": "mxfp8",
-          "routed_expert_weight_dtype": "mxfp4",
-          "shared_expert_weight_dtype": "mxfp8"
-        }
+        "operations": [
+          {
+            "id": "rms_norm_1",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "csa_attention_1",
+            "operator": {
+              "query_heads": 128,
+              "kv_heads": 1,
+              "head_dim": 512,
+              "q_lora_rank": 1536,
+              "o_lora_rank": 1024,
+              "o_groups": 16,
+              "weight_dtype": "fp8",
+              "shared_kv_projection": true,
+              "attention_sink": true,
+              "qk_rope_head_dim": 64,
+              "kv_cache_dtype": "bf16",
+              "type": "csa_attention",
+              "implementation": "compressed_kv",
+              "compress_ratio": 4,
+              "compress_overlap": 2,
+              "selected_entries": 1024,
+              "sliding_window": 128,
+              "selector": "indexer",
+              "indexer_heads": 64,
+              "indexer_head_dim": 128
+            }
+          },
+          {
+            "id": "mhc_attention_1",
+            "operator": {
+              "type": "mhc",
+              "channels": 4,
+              "sinkhorn_iters": 20,
+              "eps": 1e-06
+            }
+          },
+          {
+            "id": "rms_norm_2",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "moe_1",
+            "operator": {
+              "type": "moe",
+              "implementation": "standard_moe",
+              "expert_count": 384,
+              "experts_per_token": 6,
+              "expert_intermediate_size": 3072,
+              "shared_expert_intermediate_size": 3072,
+              "shared_expert_count": 1,
+              "activation": "swiglu",
+              "gate_activation": "sqrtsoftplus",
+              "swiglu_limit": 10.0,
+              "routed_scaling_factor": 2.5,
+              "routing": "hash",
+              "weight_dtype": "fp8",
+              "routed_expert_weight_dtype": "mxfp4",
+              "shared_expert_weight_dtype": "fp8"
+            }
+          },
+          {
+            "id": "mhc_moe_1",
+            "operator": {
+              "type": "mhc",
+              "channels": 4,
+              "sinkhorn_iters": 20,
+              "eps": 1e-06
+            }
+          }
+        ]
       }
     ],
     "layer_pattern": [
       {
         "repeat": 1,
-        "norm": {
-          "type": "rms_norm"
-        },
-        "attention": {
-          "query_heads": 128,
-          "kv_heads": 1,
-          "head_dim": 512,
-          "q_lora_rank": 1536,
-          "o_lora_rank": 1536,
-          "weight_dtype": "mxfp8",
-          "type": "hca_attention",
-          "implementation": "compressed_kv",
-          "compress_ratio": 128,
-          "compress_overlap": 1,
-          "selected_entries": 1024,
-          "sliding_window": 0,
-          "selector": "uniform",
-          "qk_rope_head_dim": 64
-        },
-        "residual": {
-          "type": "mhc",
-          "channels": 4,
-          "sinkhorn_iters": 20
-        },
-        "ffn": {
-          "type": "moe",
-          "implementation": "standard_moe",
-          "expert_count": 384,
-          "experts_per_token": 6,
-          "expert_intermediate_size": 3072,
-          "shared_expert_intermediate_size": 3072,
-          "shared_expert_count": 1,
-          "activation": "swiglu",
-          "gate_activation": "sqrtsoftplus",
-          "routed_scaling_factor": 1.5,
-          "routing": "learned",
-          "weight_dtype": "mxfp8",
-          "routed_expert_weight_dtype": "mxfp4",
-          "shared_expert_weight_dtype": "mxfp8"
-        }
+        "operations": [
+          {
+            "id": "rms_norm_1",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "hca_attention_1",
+            "operator": {
+              "query_heads": 128,
+              "kv_heads": 1,
+              "head_dim": 512,
+              "q_lora_rank": 1536,
+              "o_lora_rank": 1024,
+              "o_groups": 16,
+              "weight_dtype": "fp8",
+              "shared_kv_projection": true,
+              "attention_sink": true,
+              "qk_rope_head_dim": 64,
+              "kv_cache_dtype": "bf16",
+              "type": "hca_attention",
+              "implementation": "compressed_kv",
+              "compress_ratio": 128,
+              "compress_overlap": 1,
+              "selected_entries": 1024,
+              "sliding_window": 128,
+              "selector": "uniform"
+            }
+          },
+          {
+            "id": "mhc_attention_1",
+            "operator": {
+              "type": "mhc",
+              "channels": 4,
+              "sinkhorn_iters": 20,
+              "eps": 1e-06
+            }
+          },
+          {
+            "id": "rms_norm_2",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "moe_1",
+            "operator": {
+              "type": "moe",
+              "implementation": "standard_moe",
+              "expert_count": 384,
+              "experts_per_token": 6,
+              "expert_intermediate_size": 3072,
+              "shared_expert_intermediate_size": 3072,
+              "shared_expert_count": 1,
+              "activation": "swiglu",
+              "gate_activation": "sqrtsoftplus",
+              "swiglu_limit": 10.0,
+              "routed_scaling_factor": 2.5,
+              "routing": "learned",
+              "weight_dtype": "fp8",
+              "routed_expert_weight_dtype": "mxfp4",
+              "shared_expert_weight_dtype": "fp8"
+            }
+          },
+          {
+            "id": "mhc_moe_1",
+            "operator": {
+              "type": "mhc",
+              "channels": 4,
+              "sinkhorn_iters": 20,
+              "eps": 1e-06
+            }
+          }
+        ]
       },
       {
         "repeat": 1,
-        "norm": {
-          "type": "rms_norm"
-        },
-        "attention": {
-          "query_heads": 128,
-          "kv_heads": 1,
-          "head_dim": 512,
-          "q_lora_rank": 1536,
-          "o_lora_rank": 1536,
-          "weight_dtype": "mxfp8",
-          "type": "csa_attention",
-          "implementation": "compressed_kv",
-          "compress_ratio": 4,
-          "compress_overlap": 2,
-          "selected_entries": 1024,
-          "sliding_window": 128,
-          "selector": "indexer",
-          "indexer_heads": 128,
-          "indexer_head_dim": 128,
-          "qk_rope_head_dim": 64
-        },
-        "residual": {
-          "type": "mhc",
-          "channels": 4,
-          "sinkhorn_iters": 20
-        },
-        "ffn": {
-          "type": "moe",
-          "implementation": "standard_moe",
-          "expert_count": 384,
-          "experts_per_token": 6,
-          "expert_intermediate_size": 3072,
-          "shared_expert_intermediate_size": 3072,
-          "shared_expert_count": 1,
-          "activation": "swiglu",
-          "gate_activation": "sqrtsoftplus",
-          "routed_scaling_factor": 1.5,
-          "routing": "learned",
-          "weight_dtype": "mxfp8",
-          "routed_expert_weight_dtype": "mxfp4",
-          "shared_expert_weight_dtype": "mxfp8"
-        }
+        "operations": [
+          {
+            "id": "rms_norm_1",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "csa_attention_1",
+            "operator": {
+              "query_heads": 128,
+              "kv_heads": 1,
+              "head_dim": 512,
+              "q_lora_rank": 1536,
+              "o_lora_rank": 1024,
+              "o_groups": 16,
+              "weight_dtype": "fp8",
+              "shared_kv_projection": true,
+              "attention_sink": true,
+              "qk_rope_head_dim": 64,
+              "kv_cache_dtype": "bf16",
+              "type": "csa_attention",
+              "implementation": "compressed_kv",
+              "compress_ratio": 4,
+              "compress_overlap": 2,
+              "selected_entries": 1024,
+              "sliding_window": 128,
+              "selector": "indexer",
+              "indexer_heads": 64,
+              "indexer_head_dim": 128
+            }
+          },
+          {
+            "id": "mhc_attention_1",
+            "operator": {
+              "type": "mhc",
+              "channels": 4,
+              "sinkhorn_iters": 20,
+              "eps": 1e-06
+            }
+          },
+          {
+            "id": "rms_norm_2",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "moe_1",
+            "operator": {
+              "type": "moe",
+              "implementation": "standard_moe",
+              "expert_count": 384,
+              "experts_per_token": 6,
+              "expert_intermediate_size": 3072,
+              "shared_expert_intermediate_size": 3072,
+              "shared_expert_count": 1,
+              "activation": "swiglu",
+              "gate_activation": "sqrtsoftplus",
+              "swiglu_limit": 10.0,
+              "routed_scaling_factor": 2.5,
+              "routing": "learned",
+              "weight_dtype": "fp8",
+              "routed_expert_weight_dtype": "mxfp4",
+              "shared_expert_weight_dtype": "fp8"
+            }
+          },
+          {
+            "id": "mhc_moe_1",
+            "operator": {
+              "type": "mhc",
+              "channels": 4,
+              "sinkhorn_iters": 20,
+              "eps": 1e-06
+            }
+          }
+        ]
       }
     ],
     "output": {
@@ -247,20 +391,22 @@
         "type": "sampling"
       }
     },
-    "extra": {
-      "parameter_count": 28715386400,
-      "sharding": "tp_ep"
-    },
     "metadata": {
       "family": "DeepSeek-V4",
       "variant": "pro",
-      "mapping_quality": "parameterized_draft",
-      "parameter_target": 1600000000000,
+      "mapping_quality": "official_config_aligned",
+      "structure_accuracy": "official_text_backbone_exact",
+      "performance_formula_confidence": "mixed_medium_low",
+      "published_parameter_reference": 1600000000000,
+      "config_source": "deepseek-ai/DeepSeek-V4-Pro config.json",
+      "peripheral_modules": [
+        {
+          "name": "MTP Block ��1",
+          "status": "shown_not_estimated"
+        }
+      ],
       "unsupported_features": [
-        "MTP Block（1层）只计参数容量，不建模投机推理流程",
-        "YaRN与Muon属训练侧机制，不影响推理账单",
-        "Aux-Loss-Free bias与FP4 QAT不建模",
-        "Indexer的Hadamard变换与FP4量化按等效GEMM近似"
+        "MTP is not included in the performance estimate."
       ]
     }
   },
@@ -290,7 +436,7 @@
       "decode_tp_interpolation_rho": 1.0
     },
     "efficiencies": {
-      "_说明": "参考KDA/MLA相对结果和MLA+MoE服务数据采用的低置信度经验初值，并非Kimi K3实测。",
+      "_˵��": "�ο�KDA/MLA��Խ����MLA+MoE�������ݲ��õĵ����ŶȾ����ֵ������Kimi K3ʵ�⡣",
       "prefill_gemm": 0.55,
       "decode_gemm": 0.12,
       "prefill_attention": 0.35,

@@ -1,6 +1,6 @@
 {
   "_说明": "单芯片GQA模型示例。所有容量用byte、带宽用byte/s、时间用second。",
-  "schema_version": 2,
+  "schema_version": 3,
   "hardware": {
     "_说明": "芯片峰值算力、矩阵Tile、HBM和运行时启动参数。",
     "name": "example_100t_80g_accelerator",
@@ -47,28 +47,14 @@
       "tied_lm_head": true
     },
     "layer_pattern": [
-      {
-        "repeat": 1,
-        "norm": {
-          "type": "rms_norm"
-        },
-        "attention": {
-          "type": "standard_attention",
-          "implementation": "flash_attention",
-          "query_heads": 32,
-          "kv_heads": 8,
-          "head_dim": 128,
-          "query_width_equals_hidden": true
-        },
-        "residual": {
-          "type": "standard_residual"
-        },
-        "ffn": {
-          "type": "gated_ffn",
-          "implementation": "swiglu",
-          "intermediate_size": 11008
-        }
-      }
+      { "repeat": 1, "operations": [
+        {"id": "rms_norm_1", "operator": {"type": "rms_norm"}},
+        {"id": "attention_1", "operator": {"type": "standard_attention", "implementation": "flash_attention", "query_heads": 32, "kv_heads": 8, "head_dim": 128, "query_width_equals_hidden": true}},
+        {"id": "residual_1", "operator": {"type": "standard_residual"}},
+        {"id": "rms_norm_2", "operator": {"type": "rms_norm"}},
+        {"id": "ffn_1", "operator": {"type": "gated_ffn", "implementation": "swiglu", "intermediate_size": 11008}},
+        {"id": "residual_2", "operator": {"type": "standard_residual"}}
+      ]}
     ],
     "output": {
       "norm": {

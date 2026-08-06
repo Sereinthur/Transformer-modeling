@@ -1,6 +1,6 @@
 {
-  "_说明": "Kimi K3容量代理（官方config对齐版，2026-07-27开源权重）。1M prompt容量场景，仅int4吞吐→容量-only。93层=1×(KDA+dense)+68×(KDA+MoE)+24×(MLA+MoE)，96头，TP=8×PP=9=72设备。MoE按LatentMoE真值建模：latent_size=3584，expert=3072，shared=6144（=2个shared expert）。",
-  "schema_version": 2,
+  "_˵��": "Kimi K3 official 93-layer text backbone capacity proxy. MoonViT/PatchMerger and DSpark are shown but not estimated.",
+  "schema_version": 3,
   "hardware": {
     "name": "B200_192GiB_NVL72_capacity_proxy",
     "device_count": 72,
@@ -33,7 +33,7 @@
   },
   "model": {
     "id": "kimi-k3-official",
-    "name": "Kimi K3（官方config对齐·等效宽度）",
+    "name": "Kimi K3 (official config aligned)",
     "dimensions": {
       "layer_count": 93,
       "hidden_size": 7168,
@@ -42,10 +42,10 @@
       "padded_vocab_size": 163840
     },
     "dtype": {
-      "weight": "mxfp4",
+      "weight": "bf16",
       "activation": "mxfp8",
-      "kv_cache": "mxfp8",
-      "state": "mxfp8",
+      "kv_cache": "bf16",
+      "state": "bf16",
       "accumulation": "bf16",
       "logits": "fp32"
     },
@@ -60,91 +60,412 @@
       "type": "token_embedding",
       "tied_lm_head": false
     },
-    "layer_pattern": [
+    "layer_prefix": [
       {
         "repeat": 1,
-        "norm": {
-          "type": "rms_norm"
-        },
-        "attention": {
-          "type": "kda",
-          "implementation": "chunkwise",
-          "heads": 96,
-          "key_dim": 128,
-          "value_dim": 128,
-          "short_conv_kernel_size": 4,
-          "chunk_size": 256
-        },
-        "residual": {
-          "type": "attnres",
-          "block_count": 8
-        },
-        "ffn": {
-          "type": "gated_ffn",
-          "implementation": "swiglu",
-          "intermediate_size": 33792
-        }
+        "operations": [
+          {
+            "id": "attnres_1",
+            "operator": {
+              "type": "attnres",
+              "block_size": 12
+            }
+          },
+          {
+            "id": "rms_norm_1",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "kda_1",
+            "operator": {
+              "type": "kda",
+              "implementation": "chunkwise",
+              "heads": 96,
+              "key_dim": 128,
+              "value_dim": 128,
+              "short_conv_kernel_size": 4,
+              "chunk_size": 256
+            }
+          },
+          {
+            "id": "standard_residual_1",
+            "operator": {
+              "type": "standard_residual"
+            }
+          },
+          {
+            "id": "rms_norm_2",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "gated_ffn_1",
+            "operator": {
+              "type": "gated_ffn",
+              "implementation": "situ_glu",
+              "intermediate_size": 33792,
+              "activation_situ_beta": 4.0,
+              "activation_situ_linear_beta": 25.0,
+              "situ_ops_per_element": 6.0
+            }
+          },
+          {
+            "id": "standard_residual_2",
+            "operator": {
+              "type": "standard_residual"
+            }
+          }
+        ]
       },
       {
-        "repeat": 68,
-        "norm": {
-          "type": "rms_norm"
-        },
-        "attention": {
-          "type": "kda",
-          "implementation": "chunkwise",
-          "heads": 96,
-          "key_dim": 128,
-          "value_dim": 128,
-          "short_conv_kernel_size": 4,
-          "chunk_size": 256
-        },
-        "residual": {
-          "type": "attnres",
-          "block_count": 8
-        },
-        "ffn": {
-          "type": "moe",
-          "implementation": "latent_moe_approx",
-          "expert_count": 896,
-          "experts_per_token": 16,
-          "expert_intermediate_size": 3072,
-          "shared_expert_intermediate_size": 6144,
-          "activation": "swiglu",
-          "situ_ops_per_element": 6,
-          "latent_size": 3584
-        }
+        "repeat": 2,
+        "operations": [
+          {
+            "id": "attnres_1",
+            "operator": {
+              "type": "attnres",
+              "block_size": 12
+            }
+          },
+          {
+            "id": "rms_norm_1",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "kda_1",
+            "operator": {
+              "type": "kda",
+              "implementation": "chunkwise",
+              "heads": 96,
+              "key_dim": 128,
+              "value_dim": 128,
+              "short_conv_kernel_size": 4,
+              "chunk_size": 256
+            }
+          },
+          {
+            "id": "standard_residual_1",
+            "operator": {
+              "type": "standard_residual"
+            }
+          },
+          {
+            "id": "rms_norm_2",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "moe_1",
+            "operator": {
+              "type": "moe",
+              "implementation": "latent_moe_approx",
+              "expert_count": 896,
+              "experts_per_token": 16,
+              "expert_intermediate_size": 3072,
+              "shared_expert_intermediate_size": 3072,
+              "shared_expert_count": 2,
+              "latent_size": 3584,
+              "activation": "situ",
+              "situ_ops_per_element": 6.0,
+              "activation_situ_beta": 4.0,
+              "activation_situ_linear_beta": 25.0,
+              "weight_dtype": "bf16",
+              "routed_expert_weight_dtype": "mxfp4",
+              "shared_expert_weight_dtype": "bf16"
+            }
+          },
+          {
+            "id": "standard_residual_2",
+            "operator": {
+              "type": "standard_residual"
+            }
+          }
+        ]
       },
       {
-        "repeat": 24,
-        "norm": {
-          "type": "rms_norm"
-        },
-        "attention": {
-          "type": "gated_mla",
-          "implementation": "latent_cache",
-          "query_heads": 96,
-          "q_lora_rank": 1536,
-          "kv_lora_rank": 512,
-          "qk_nope_head_dim": 128,
-          "qk_rope_head_dim": 64,
-          "v_head_dim": 128
-        },
-        "residual": {
-          "type": "attnres",
-          "block_count": 8
-        },
-        "ffn": {
-          "type": "moe",
-          "implementation": "latent_moe_approx",
-          "expert_count": 896,
-          "experts_per_token": 16,
-          "expert_intermediate_size": 3072,
-          "shared_expert_intermediate_size": 6144,
-          "activation": "swiglu",
-          "situ_ops_per_element": 6,
-          "latent_size": 3584
-        }
+        "repeat": 1,
+        "operations": [
+          {
+            "id": "attnres_1",
+            "operator": {
+              "type": "attnres",
+              "block_size": 12
+            }
+          },
+          {
+            "id": "rms_norm_1",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "gated_mla_1",
+            "operator": {
+              "type": "gated_mla",
+              "implementation": "latent_cache",
+              "query_heads": 96,
+              "q_lora_rank": 1536,
+              "kv_lora_rank": 512,
+              "qk_nope_head_dim": 128,
+              "qk_rope_head_dim": 64,
+              "v_head_dim": 128
+            }
+          },
+          {
+            "id": "standard_residual_1",
+            "operator": {
+              "type": "standard_residual"
+            }
+          },
+          {
+            "id": "rms_norm_2",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "moe_1",
+            "operator": {
+              "type": "moe",
+              "implementation": "latent_moe_approx",
+              "expert_count": 896,
+              "experts_per_token": 16,
+              "expert_intermediate_size": 3072,
+              "shared_expert_intermediate_size": 3072,
+              "shared_expert_count": 2,
+              "latent_size": 3584,
+              "activation": "situ",
+              "situ_ops_per_element": 6.0,
+              "activation_situ_beta": 4.0,
+              "activation_situ_linear_beta": 25.0,
+              "weight_dtype": "bf16",
+              "routed_expert_weight_dtype": "mxfp4",
+              "shared_expert_weight_dtype": "bf16"
+            }
+          },
+          {
+            "id": "standard_residual_2",
+            "operator": {
+              "type": "standard_residual"
+            }
+          }
+        ]
+      }
+    ],
+    "layer_pattern": [
+      {
+        "repeat": 3,
+        "operations": [
+          {
+            "id": "attnres_1",
+            "operator": {
+              "type": "attnres",
+              "block_size": 12
+            }
+          },
+          {
+            "id": "rms_norm_1",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "kda_1",
+            "operator": {
+              "type": "kda",
+              "implementation": "chunkwise",
+              "heads": 96,
+              "key_dim": 128,
+              "value_dim": 128,
+              "short_conv_kernel_size": 4,
+              "chunk_size": 256
+            }
+          },
+          {
+            "id": "standard_residual_1",
+            "operator": {
+              "type": "standard_residual"
+            }
+          },
+          {
+            "id": "rms_norm_2",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "moe_1",
+            "operator": {
+              "type": "moe",
+              "implementation": "latent_moe_approx",
+              "expert_count": 896,
+              "experts_per_token": 16,
+              "expert_intermediate_size": 3072,
+              "shared_expert_intermediate_size": 3072,
+              "shared_expert_count": 2,
+              "latent_size": 3584,
+              "activation": "situ",
+              "situ_ops_per_element": 6.0,
+              "activation_situ_beta": 4.0,
+              "activation_situ_linear_beta": 25.0,
+              "weight_dtype": "bf16",
+              "routed_expert_weight_dtype": "mxfp4",
+              "shared_expert_weight_dtype": "bf16"
+            }
+          },
+          {
+            "id": "standard_residual_2",
+            "operator": {
+              "type": "standard_residual"
+            }
+          }
+        ]
+      },
+      {
+        "repeat": 1,
+        "operations": [
+          {
+            "id": "attnres_1",
+            "operator": {
+              "type": "attnres",
+              "block_size": 12
+            }
+          },
+          {
+            "id": "rms_norm_1",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "gated_mla_1",
+            "operator": {
+              "type": "gated_mla",
+              "implementation": "latent_cache",
+              "query_heads": 96,
+              "q_lora_rank": 1536,
+              "kv_lora_rank": 512,
+              "qk_nope_head_dim": 128,
+              "qk_rope_head_dim": 64,
+              "v_head_dim": 128
+            }
+          },
+          {
+            "id": "standard_residual_1",
+            "operator": {
+              "type": "standard_residual"
+            }
+          },
+          {
+            "id": "rms_norm_2",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "moe_1",
+            "operator": {
+              "type": "moe",
+              "implementation": "latent_moe_approx",
+              "expert_count": 896,
+              "experts_per_token": 16,
+              "expert_intermediate_size": 3072,
+              "shared_expert_intermediate_size": 3072,
+              "shared_expert_count": 2,
+              "latent_size": 3584,
+              "activation": "situ",
+              "situ_ops_per_element": 6.0,
+              "activation_situ_beta": 4.0,
+              "activation_situ_linear_beta": 25.0,
+              "weight_dtype": "bf16",
+              "routed_expert_weight_dtype": "mxfp4",
+              "shared_expert_weight_dtype": "bf16"
+            }
+          },
+          {
+            "id": "standard_residual_2",
+            "operator": {
+              "type": "standard_residual"
+            }
+          }
+        ]
+      }
+    ],
+    "layer_suffix": [
+      {
+        "repeat": 1,
+        "operations": [
+          {
+            "id": "attnres_1",
+            "operator": {
+              "type": "attnres",
+              "block_size": 12
+            }
+          },
+          {
+            "id": "rms_norm_1",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "gated_mla_1",
+            "operator": {
+              "type": "gated_mla",
+              "implementation": "latent_cache",
+              "query_heads": 96,
+              "q_lora_rank": 1536,
+              "kv_lora_rank": 512,
+              "qk_nope_head_dim": 128,
+              "qk_rope_head_dim": 64,
+              "v_head_dim": 128
+            }
+          },
+          {
+            "id": "standard_residual_1",
+            "operator": {
+              "type": "standard_residual"
+            }
+          },
+          {
+            "id": "rms_norm_2",
+            "operator": {
+              "type": "rms_norm"
+            }
+          },
+          {
+            "id": "moe_1",
+            "operator": {
+              "type": "moe",
+              "implementation": "latent_moe_approx",
+              "expert_count": 896,
+              "experts_per_token": 16,
+              "expert_intermediate_size": 3072,
+              "shared_expert_intermediate_size": 3072,
+              "shared_expert_count": 2,
+              "latent_size": 3584,
+              "activation": "situ",
+              "situ_ops_per_element": 6.0,
+              "activation_situ_beta": 4.0,
+              "activation_situ_linear_beta": 25.0,
+              "weight_dtype": "bf16",
+              "routed_expert_weight_dtype": "mxfp4",
+              "shared_expert_weight_dtype": "bf16"
+            }
+          },
+          {
+            "id": "standard_residual_2",
+            "operator": {
+              "type": "standard_residual"
+            }
+          }
+        ]
       }
     ],
     "output": {
@@ -158,23 +479,26 @@
         "type": "sampling"
       }
     },
-    "extra": {
-      "parameter_count": 28911125504,
-      "sharding": "tp_ep"
-    },
     "metadata": {
       "family": "Kimi K3 Hybrid MoE",
-      "scenario": "official_config_aligned",
-      "mapping_quality": "official_config_with_equivalent_width",
-      "parameter_target": 2800000000000,
-      "config_source": "moonshotai/Kimi-K3 config.json (2026-07-27)",
-      "layer_order_note": "官方layer_types为3:1交错（full_attn_layers=[4,8,...,92,93]），本pattern按分组展开（68×KDA后接24×MLA），TP-only聚合结果等价，PP stage均衡性有偏差",
-      "unsupported_features": [
-        "SiTU-GLU精确方程（beta=4.0/25.0）",
-        "MoonViT-V2视觉前端",
-        "DSpark投机解码"
+      "mapping_quality": "official_config_aligned",
+      "structure_accuracy": "official_text_backbone_exact",
+      "performance_formula_confidence": "mixed_medium_low",
+      "published_parameter_reference": 2780000000000,
+      "config_source": "moonshotai/Kimi-K3 config.json",
+      "peripheral_modules": [
+        {
+          "name": "MoonViT-V2 + PatchMergerV2",
+          "status": "shown_not_estimated"
+        },
+        {
+          "name": "DSpark",
+          "status": "shown_not_estimated"
+        }
       ],
-      "moe_mapping": "latent_size=3584显式建模共享下/上投影，专家GEMM与EP通信均在latent域"
+      "unsupported_features": [
+        "MoonViT-V2, PatchMergerV2 and DSpark are not estimated."
+      ]
     }
   },
   "serving": {
@@ -203,7 +527,7 @@
       "decode_tp_interpolation_rho": 1.0
     },
     "efficiencies": {
-      "_说明": "参考KDA/MLA相对结果和MLA+MoE服务数据采用的低置信度经验初值，并非Kimi K3实测。",
+      "_˵��": "�ο�KDA/MLA��Խ����MLA+MoE�������ݲ��õĵ����ŶȾ����ֵ������Kimi K3ʵ�⡣",
       "prefill_gemm": 0.55,
       "decode_gemm": 0.12,
       "prefill_attention": 0.35,

@@ -16,7 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="transformer-model",
         description="按可替换算子估算Transformer容量、延迟、带宽和吞吐。",
     )
-    parser.add_argument("config", type=Path, help="Schema v2 JSON配置路径")
+    parser.add_argument("config", type=Path, help="Schema v3 JSON 配置路径")
     parser.add_argument("-o", "--output", type=Path, help="Write result JSON to this path")
     parser.add_argument(
         "--no-details",

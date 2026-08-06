@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from math import ceil
 from typing import Any
 
 from ..communication import collective_profile
@@ -17,33 +16,24 @@ def _group_layer_operators(layers) -> list[tuple[object, int]]:
 
     grouped: dict[tuple[str, str, str], list[object | int]] = {}
     for layer in layers:
-        if layer.residual.type == "attnres":
-            # Block AttnRes先聚合深度表示，再经PreNorm进入Attention/FFN。
-            sequence = (
-                (layer.residual, 1), (layer.norm, 1), (layer.attention, 1),
-                (layer.residual, 1), (layer.norm, 1), (layer.ffn, 1),
-            )
-        else:
-            sequence = (
-                (layer.norm, 1), (layer.attention, 1), (layer.residual, 1),
-                (layer.norm, 1), (layer.ffn, 1), (layer.residual, 1),
-            )
-        for spec, multiplier in sequence:
+        for spec in layer.main_operators:
             key = spec.signature()
             if key not in grouped:
                 grouped[key] = [spec, 0]
-            grouped[key][1] = int(grouped[key][1]) + multiplier
+            grouped[key][1] = int(grouped[key][1]) + 1
     return [(value[0], int(value[1])) for value in grouped.values()]
 
 
 def build_estimates(config, layers, phase: str, batch_size: int,
                     token_length: int, attention_length: int,
-                    include_embedding: bool, include_output: bool) -> list[OperatorEstimate]:
+                    include_embedding: bool, include_output: bool,
+                    layer_start: int = 0) -> list[OperatorEstimate]:
     estimates: list[OperatorEstimate] = []
 
-    def add(spec, count=1):
+    def add(spec, count=1, *, start=0, output=False):
         context = OperatorContext(
-            config, phase, batch_size, token_length, attention_length, count
+            config, phase, batch_size, token_length, attention_length, count,
+            start, output,
         )
         operator = get_operator(spec.type)
         estimates.append(
@@ -53,12 +43,15 @@ def build_estimates(config, layers, phase: str, batch_size: int,
 
     if include_embedding:
         add(config.model.embedding)
-    for spec, count in _group_layer_operators(layers):
-        add(spec, count)
+    # Preserve literal operation order.  This is deliberately not a fixed-slot
+    # estimator: inserting or moving a card changes the evaluated sequence.
+    for index, layer in enumerate(layers):
+        for spec in layer.main_operators:
+            add(
+                spec, 1, start=layer_start + index,
+                output=include_output and index == len(layers) - 1 and spec.type in {"attnres", "mhc"},
+            )
     if include_output:
-        # AttnRes模型在Final Norm前还需对最终partial block做一次深度聚合。
-        if layers and layers[-1].residual.type == "attnres":
-            add(layers[-1].residual)
         add(config.model.output.norm)
         add(config.model.output.head)
         add(config.model.output.sampling)
@@ -126,10 +119,10 @@ def _operator_result(config, estimate: OperatorEstimate, phase: str) -> dict[str
 def summarize_stage(config, layers, phase: str, batch_size: int,
                     token_length: int, attention_length: int,
                     include_embedding: bool, include_output: bool,
-                    details: bool = True) -> dict[str, Any]:
+                    details: bool = True, layer_start: int = 0) -> dict[str, Any]:
     estimates = build_estimates(
         config, layers, phase, batch_size, token_length, attention_length,
-        include_embedding, include_output,
+        include_embedding, include_output, layer_start,
     )
     results = [_operator_result(config, item, phase) for item in estimates]
     latency = sum(item["time_seconds"]["estimated"] for item in results)
@@ -157,23 +150,21 @@ def _layer_weights(config, layers) -> list[float]:
     """用当前请求的Prefill+全部Decode近似成本平衡异构层。"""
 
     weights = []
-    active = min(config.parallelism.expert_parallel, config.serving.batch_size)
-    local_batch = ceil(config.serving.batch_size / active)
     # 相同签名的层成本一致，只估算一次。
     cache: dict[tuple, float] = {}
-    for layer in layers:
+    for layer_index, layer in enumerate(layers):
         key = (
-            layer.norm.signature(), layer.attention.signature(),
-            layer.residual.signature(), layer.ffn.signature(),
+            tuple(operator.signature() for operator in layer.main_operators),
+            layer_index if any(op.type in {"attnres", "mhc"} for op in layer.main_operators) else None,
         )
         if key not in cache:
             prefill = summarize_stage(
-                config, [layer], "prefill", local_batch, config.serving.prompt_length,
-                config.serving.prompt_length, False, False, False,
+                config, [layer], "prefill", config.serving.batch_size, config.serving.prompt_length,
+                config.serving.prompt_length, False, False, False, layer_index,
             )["latency_seconds"]
             decode = summarize_stage(
-                config, [layer], "decode", local_batch, 1,
-                config.serving.prompt_length, False, False, False,
+                config, [layer], "decode", config.serving.batch_size, 1,
+                config.serving.prompt_length, False, False, False, layer_index,
             )["latency_seconds"]
             cache[key] = prefill + max(0, config.serving.output_length - 1) * decode
         weights.append(cache[key])
@@ -226,21 +217,27 @@ def summarize_parallel_phase(config, phase: str, attention_length: int,
     microbatches = config.parallelism.pipeline_microbatches
     micro_batch = config.serving.batch_size // microbatches
     active_ep = min(config.parallelism.expert_parallel, micro_batch)
-    local_batch = ceil(micro_batch / active_ep)
     token_length = config.serving.prompt_length if phase == "prefill" else 1
-    stage_results = [
-        summarize_stage(
-            config, stage_layers, phase, local_batch, token_length, attention_length,
-            index == 0, index == len(stages) - 1, details,
-        )
-        for index, stage_layers in enumerate(stages)
-    ]
+    stage_results = []
+    layer_start = 0
+    for index, stage_layers in enumerate(stages):
+        stage_results.append(summarize_stage(
+            config, stage_layers, phase, micro_batch, token_length, attention_length,
+            index == 0, index == len(stages) - 1, details, layer_start,
+        ))
+        layer_start += len(stage_layers)
     pp = len(stages)
     if pp > 1:
-        payload = local_batch * token_length * config.model.hidden_size * config.model.activation_bytes
-        bandwidth = float(config.hardware.interconnect.effective_pipeline_bandwidth or 1)
-        alpha = float(config.hardware.interconnect.effective_pipeline_latency or 0)
-        sends = [alpha + payload / bandwidth] * (pp - 1) + [0.0]
+        bandwidth = float(config.hardware.interconnect.effective_pipeline_bandwidth)
+        alpha = float(config.hardware.interconnect.effective_pipeline_latency)
+        cumulative = 0
+        sends = []
+        for stage_layers in stages[:-1]:
+            cumulative += len(stage_layers)
+            width = config.model.state_width_after_layer(cumulative - 1)
+            payload = micro_batch * token_length * width * config.model.activation_bytes
+            sends.append(alpha + payload / bandwidth)
+        sends.append(0.0)
     else:
         sends = [0.0]
     schedule = pipeline_schedule(

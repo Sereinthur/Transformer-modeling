@@ -21,33 +21,41 @@ def pipeline_schedule(
 ) -> dict[str, Any]:
     """用flow-shop递推计算前向流水的填充、稳态和排空时间。
 
-    Stage占用只包含本地计算；发送只推迟下游的就绪时间，
-    可与本Stage下一个microbatch的计算重叠（发送占用互联而非算力）。
+    发送可与本Stage下一个microbatch的计算重叠，但同一相邻Stage链路上的
+    发送会串行化，避免多个microbatch竞争同一有效带宽。
     """
 
     stage_count = len(stage_compute_seconds)
+    if not stage_count:
+        raise ValueError("pipeline schedule requires at least one stage")
     if len(stage_send_seconds) != stage_count:
         raise ValueError("stage_send_seconds must match stage_compute_seconds")
+    if microbatches <= 0:
+        raise ValueError("microbatches must be greater than zero")
+    if any(value < 0 for value in (*stage_compute_seconds, *stage_send_seconds)):
+        raise ValueError("stage compute and send times must be non-negative")
     finishes = [[0.0 for _ in range(microbatches)] for _ in range(stage_count)]
     starts = [[0.0 for _ in range(microbatches)] for _ in range(stage_count)]
+    send_finishes = [[0.0 for _ in range(microbatches)] for _ in range(stage_count)]
     services = [
         stage_compute_seconds[index] + stage_send_seconds[index]
         for index in range(stage_count)
     ]
     for microbatch in range(microbatches):
         for stage in range(stage_count):
-            upstream_ready = (
-                finishes[stage - 1][microbatch] + stage_send_seconds[stage - 1]
-                if stage else 0.0
-            )
+            upstream_ready = send_finishes[stage - 1][microbatch] if stage else 0.0
             stage_ready = finishes[stage][microbatch - 1] if microbatch else 0.0
             starts[stage][microbatch] = max(upstream_ready, stage_ready)
             finishes[stage][microbatch] = (
                 starts[stage][microbatch] + stage_compute_seconds[stage]
             )
+            link_ready = send_finishes[stage][microbatch - 1] if microbatch else 0.0
+            send_finishes[stage][microbatch] = max(
+                finishes[stage][microbatch], link_ready
+            ) + stage_send_seconds[stage]
 
-    makespan = finishes[-1][-1] + stage_send_seconds[-1]
-    round_trip = finishes[-1][0] + stage_send_seconds[-1]  # 单个microbatch的全程延迟
+    makespan = send_finishes[-1][-1]
+    round_trip = send_finishes[-1][0]  # 单个microbatch的全程延迟
     busy_slot_seconds = microbatches * sum(stage_compute_seconds) #所有stage实际工作总时间
     available_slot_seconds = stage_count * makespan #所有stage可用总时间
     idle_slot_seconds = max(0.0, available_slot_seconds - busy_slot_seconds) #所有stage空闲总时间

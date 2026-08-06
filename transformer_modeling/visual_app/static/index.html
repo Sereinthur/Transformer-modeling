@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>推理性能可视化建模 · Visual Modeling</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ============ 顶部工具栏 ============ -->
+<header class="toolbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span class="brand-text">
+      <strong>VISUAL&nbsp;MODELING</strong>
+      <small>大模型推理性能建模台</small>
+    </span>
+  </div>
+
+  <div class="toolbar-group">
+    <label class="field-inline">
+      <span class="field-inline-label">模型预设</span>
+      <select id="preset-select" class="ctl ctl-select ctl-preset">
+        <option value="">加载中…</option>
+      </select>
+    </label>
+    <p id="preset-desc" class="preset-desc" title=""></p>
+  </div>
+
+  <div class="toolbar-spacer"></div>
+
+  <div class="toolbar-group toolbar-actions">
+    <button id="btn-compute" class="btn btn-primary" title="按当前流程图与配置执行估算 (Ctrl+Enter)">
+      <span class="btn-glyph">▶</span> 计算
+    </button>
+    <button id="btn-import" class="btn" title="从本地 JSON 导入配置">导入</button>
+    <button id="btn-export" class="btn" title="导出当前配置为 JSON">导出</button>
+    <input type="file" id="file-import" accept=".json,application/json" hidden>
+  </div>
+</header>
+
+<!-- ============ 主体三栏 ============ -->
+<main class="workspace" id="workspace">
+
+  <!-- ---- 左侧栏：运行配置 ---- -->
+  <aside class="sidebar" id="sidebar">
+    <div class="panel-head">
+      <h2 class="panel-title">运行配置</h2>
+      <button id="btn-sidebar-toggle" class="icon-btn" title="折叠 / 展开左侧栏">‹</button>
+    </div>
+    <nav class="tabs" id="sidebar-tabs" role="tablist">
+      <button class="tab is-active" data-tab="model" role="tab">模型</button>
+      <button class="tab" data-tab="hardware" role="tab">硬件</button>
+      <button class="tab" data-tab="serving" role="tab">请求</button>
+      <button class="tab" data-tab="execution" role="tab">执行</button>
+      <button class="tab" data-tab="parallelism" role="tab">并行</button>
+    </nav>
+    <div class="sidebar-body" id="sidebar-body">
+      <p class="hint">配置加载中…</p>
+    </div>
+    <div class="sidebar-rail" id="sidebar-rail" title="展开左侧栏">配<br>置</div>
+  </aside>
+
+  <!-- ---- 中央：流程图画布 ---- -->
+  <section class="canvas-area">
+    <div class="canvas-bar">
+      <div class="model-info" id="model-info">
+        <span class="mi-name">—</span>
+      </div>
+      <div class="canvas-tools">
+        <button id="btn-collapse-all" class="icon-btn" title="折叠全部 Layer 组">⊟</button>
+        <button id="btn-expand-all" class="icon-btn" title="展开全部 Layer 组">⊞</button>
+        <span class="tool-sep"></span>
+        <button id="btn-zoom-out" class="icon-btn" title="缩小">−</button>
+        <span class="zoom-level" id="zoom-level">100%</span>
+        <button id="btn-zoom-in" class="icon-btn" title="放大">+</button>
+        <button id="btn-fit" class="icon-btn" title="适应画布">⤢</button>
+        <span class="tool-sep"></span>
+        <button id="btn-layout" class="icon-btn" title="布局参数（间距 / 卡宽）">⚙</button>
+        <button id="btn-reset-offsets" class="icon-btn" title="重置节点微调位置">↺</button>
+      </div>
+      <!-- 布局参数弹层：由 app.js 控制开合，数值变更即时重绘并持久化 -->
+      <div class="layout-popover" id="layout-popover" hidden>
+        <p class="layout-popover-title">布局参数</p>
+        <label class="layout-field">
+          <span>卡片垂直间距</span>
+          <input id="layout-input-cardGap" class="ctl" type="number" min="8" max="60" step="1">
+        </label>
+        <label class="layout-field">
+          <span>组间距</span>
+          <input id="layout-input-groupGap" class="ctl" type="number" min="20" max="120" step="2">
+        </label>
+        <label class="layout-field">
+          <span>卡片宽度</span>
+          <input id="layout-input-cardW" class="ctl" type="number" min="180" max="320" step="2">
+        </label>
+        <div class="layout-popover-actions">
+          <button id="btn-layout-reset" class="btn btn-ghost btn-mini">恢复默认</button>
+        </div>
+      </div>
+    </div>
+    <div class="canvas-host" id="flow-canvas">
+      <!-- SVG 由 flowchart.js 注入 -->
+    </div>
+    <div class="canvas-legend">
+      <span class="lg" data-cat="embedding">Embedding</span>
+      <span class="lg" data-cat="attention">Attention</span>
+      <span class="lg" data-cat="ffn">FFN / MoE</span>
+      <span class="lg" data-cat="norm">Norm</span>
+      <span class="lg" data-cat="residual">Residual</span>
+      <span class="lg" data-cat="output">Output</span>
+      <span class="lg" data-cat="layer">Layer 组</span>
+    </div>
+  </section>
+
+  <!-- ---- 右侧栏：算子参数 ---- -->
+  <aside class="inspector" id="inspector">
+    <div class="panel-head">
+      <h2 class="panel-title">算子参数</h2>
+      <span class="panel-tag" id="inspector-tag"></span>
+    </div>
+    <div class="inspector-body" id="inspector-body">
+      <!-- operator-panel.js 渲染 -->
+    </div>
+  </aside>
+</main>
+
+<!-- ============ 底部：估算结果 ============ -->
+<footer class="results is-collapsed" id="results-panel">
+  <div class="results-head" id="results-head">
+    <h2 class="panel-title">估算结果</h2>
+    <div class="results-summary" id="results-summary">
+      <span class="hint">尚未计算</span>
+    </div>
+    <button id="btn-results-toggle" class="icon-btn" title="折叠 / 展开结果面板">⌃</button>
+  </div>
+  <div class="results-body" id="results-body">
+    <div class="empty-state">
+      <div class="empty-glyph">∑</div>
+      <p>点击顶部 <strong>计算</strong> 按钮，将当前流程图与运行配置提交给求解器。</p>
+    </div>
+  </div>
+</footer>
+
+<!-- ============ 浮层容器 ============ -->
+<div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+<div class="modal-root" id="modal-root"></div>
+<div class="loading-veil" id="loading-veil" hidden>
+  <div class="loading-box">
+    <div class="spinner"></div>
+    <span id="loading-text">处理中…</span>
+  </div>
+</div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

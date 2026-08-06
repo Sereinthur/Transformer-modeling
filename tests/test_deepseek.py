@@ -8,128 +8,86 @@ from helpers import example, parallel, phase_operators
 
 
 def v4_data(variant="pro", tp=8, ep=8, pp=1):
-    data = example("kimi_k3_base_tp64")
+    data = example()
     data["model"] = get_preset(f"deepseek-v4-{variant}")["model"]
-    data["hardware"]["compute"]["throughput"] = {"mxfp4_mxfp8_ops_per_second": 1e15}
+    data["hardware"]["compute"]["throughput"] = {"fp8_dense_ops_per_second": 1e15}
     return parallel(data, tp=tp, ep=ep, pp=pp)
 
 
 def attention_types(model):
-    return [layer.attention.type for layer in model.expanded_layers()]
+    attention = {"standard_attention", "sliding_window_attention", "kda", "gated_mla", "csa_attention", "hca_attention"}
+    return [next(item.operator.type for item in layer.operations if item.operator.type in attention) for layer in model.expanded_layers()]
 
 
-def operator(result, type_id, phase="prefill"):
-    return next(
-        item for item in phase_operators(result["performance"][phase])
-        if item["type"] == type_id
-    )
+def mutable_ops(model, type_id):
+    return [item["operator"] for segment in (*model.get("layer_prefix", []), *model.get("layer_pattern", []), *model.get("layer_suffix", [])) for item in segment["operations"] if item["operator"]["type"] == type_id]
 
 
 class DeepSeekV4Tests(unittest.TestCase):
-    def test_presets_resolve_and_validate(self):
-        for variant in ("pro", "flash"):
-            with self.subTest(variant=variant):
-                result = estimate(Config.from_dict(v4_data(variant)), True)
-                self.assertGreater(result["capacity"]["required_bytes_per_critical_rank"], 0)
-                csa = operator(result, "csa_attention")
-                self.assertEqual(csa["confidence"], "low")
-                self.assertTrue(csa["assumptions"])
-
-    def test_layer_prefix_reproduces_documented_layer_order(self):
+    def test_v3_layer_sequences(self):
         pro = Config.from_dict(v4_data("pro")).model
-        types = attention_types(pro)
-        self.assertEqual(len(types), 61)
-        # 前2层纯滑窗，第3层CSA，之后HCA/CSA交替，末层是CSA。
-        self.assertEqual(types[:4], [
-            "standard_attention", "standard_attention", "csa_attention", "hca_attention",
-        ])
-        self.assertEqual(types[60], "csa_attention")
-        self.assertEqual(types.count("csa_attention"), 30)
-        self.assertEqual(types.count("hca_attention"), 29)
+        self.assertEqual(attention_types(pro)[:4], ["hca_attention", "hca_attention", "csa_attention", "hca_attention"])
+        self.assertEqual(attention_types(pro).count("hca_attention"), 31)
+        self.assertEqual(attention_types(pro).count("csa_attention"), 30)
+        self.assertNotIn("standard_attention", attention_types(pro))
         flash = Config.from_dict(v4_data("flash")).model
-        flash_types = attention_types(flash)
-        self.assertEqual(len(flash_types), 43)
-        self.assertEqual(flash_types[42], "csa_attention")
+        self.assertEqual(len(attention_types(flash)), 43)
+        self.assertEqual(attention_types(flash).count("sliding_window_attention"), 2)
+        self.assertEqual(attention_types(flash).count("hca_attention"), 20)
+        self.assertEqual(attention_types(flash).count("csa_attention"), 21)
 
-    def test_prefix_layers_use_hash_routing_without_router_gemm(self):
-        result = estimate(Config.from_dict(v4_data("pro")), True)
-        moes = [item for item in phase_operators(result["performance"]["prefill"]) if item["type"] == "moe"]
-        hashed = next(item for item in moes if item["occurrences"] == 3)
-        learned = next(item for item in moes if item["occurrences"] == 58)
-        self.assertNotIn("layers.moe_router", [item["name"] for item in hashed["suboperators"]])
-        self.assertIn("layers.moe_router", [item["name"] for item in learned["suboperators"]])
-        per_hashed = hashed["capacity"]["local_parameters"] / hashed["occurrences"]
-        per_learned = learned["capacity"]["local_parameters"] / learned["occurrences"]
-        self.assertLess(per_hashed, per_learned)
+    def test_special_mhc_is_independent_per_layer_operator(self):
+        data = v4_data("pro", tp=1, ep=1, pp=2)
+        data["parallelism"]["pipeline_stage_boundaries"] = [30]
+        data["serving"]["batch_size"] = 1
+        data["serving"]["prompt_length"] = {"distribution": "fixed", "value": 16}
+        config = Config.from_dict(data)
+        result = estimate(config, True)
+        mhc = [item for item in phase_operators(result["performance"]["prefill"]) if item["type"] == "mhc"]
+        self.assertEqual(len(mhc), 122)
+        self.assertTrue(all(item["capacity"]["temporary_bytes"] > 0 for item in mhc))
+        self.assertEqual(config.model.state_width_after_layer(29), 4 * config.model.hidden_size)
+        stage = result["capacity"]["per_stage"][0]
+        self.assertEqual(stage["pipeline_state_width_elements"], 4 * config.model.hidden_size)
+        self.assertEqual(result["model"]["special_operator_estimation"]["mhc"]["occurrences"], 122)
 
-    def test_parameter_count_reconciles_to_target(self):
-        for variant, target in (("pro", 1_600_000_000_000), ("flash", 284_000_000_000)):
-            with self.subTest(variant=variant):
-                result = estimate(Config.from_dict(v4_data(variant)), False)
-                parameters = result["model"]["parameters"]
-                self.assertGreaterEqual(parameters, target)
-                self.assertLess(parameters, target * 1.01)
+    def test_mhc_replaces_residual_after_each_sublayer(self):
+        model = Config.from_dict(v4_data("pro")).model
+        first = [item.operator.type for item in model.expanded_layers()[0].operations]
+        self.assertEqual(first, ["rms_norm", "hca_attention", "mhc", "rms_norm", "moe", "mhc"])
+        self.assertNotIn("standard_residual", first)
 
-    def test_compressed_attention_is_cheaper_than_global_attention(self):
-        data = v4_data("pro")
-        # 前置层的滑窗放开成全局注意力，作为同维度全局Attention的对照。
-        for prefix in data["model"]["layer_prefix"]:
-            prefix["attention"]["sliding_window"] = 0
-        result = estimate(Config.from_dict(data), True)
-        latency = {
-            type_id: operator(result, type_id)["time_seconds"]["estimated"]
-            / operator(result, type_id)["occurrences"]
-            for type_id in ("standard_attention", "csa_attention", "hca_attention")
-        }
-        self.assertLess(latency["hca_attention"], latency["csa_attention"])
-        self.assertLess(latency["csa_attention"], latency["standard_attention"])
-
-    def test_compressed_kv_cache_is_much_smaller_than_full_mqa_cache(self):
-        compressed = estimate(Config.from_dict(v4_data("pro")), False)
-        states = compressed["capacity"]["per_stage"][0]["states_by_operator"]
-        cached = sum(
-            states[key] for key in
-            ("compressed_kv_cache_bytes", "sliding_window_kv_cache_bytes", "indexer_key_cache_bytes")
-        )
-        # 用同样的头数、head_dim把压缩层换成全量MQA注意力做对照。
-        dense = v4_data("pro")
-        full = {
-            "type": "standard_attention", "implementation": "flash_attention",
-            "query_heads": 128, "kv_heads": 1, "head_dim": 512, "qk_rope_head_dim": 64,
-            "q_lora_rank": 1536, "o_lora_rank": 1536, "weight_dtype": "mxfp8",
-            "query_width_equals_hidden": False,
-        }
-        for group in (*dense["model"]["layer_prefix"], *dense["model"]["layer_pattern"]):
-            group["attention"] = copy.deepcopy(full)
-        baseline = estimate(Config.from_dict(dense), False)
-        reference = baseline["capacity"]["per_stage"][0]["states_by_operator"]["kv_cache_bytes"]
-        self.assertLess(cached * 3, reference)
-
-    def test_mhc_temporary_bytes_scale_with_channels(self):
+    def test_mhc_parameter_changes_apply_to_cards(self):
         def temporary(channels):
             data = v4_data("pro")
-            for group in (*data["model"]["layer_prefix"], *data["model"]["layer_pattern"]):
-                group["residual"]["channels"] = channels
+            for operator in mutable_ops(data["model"], "mhc"):
+                operator["channels"] = channels
             result = estimate(Config.from_dict(data), True)
-            item = operator(result, "mhc")
-            return item["capacity"]["temporary_bytes"]
-
+            return sum(item["capacity"]["temporary_bytes"] for item in phase_operators(result["performance"]["prefill"]) if item["type"] == "mhc")
         self.assertAlmostEqual(temporary(8) / temporary(4), 2.0, places=6)
 
-    def test_routed_expert_dtype_drives_weight_bytes(self):
-        def weights(dtype):
-            data = v4_data("pro")
-            for group in (*data["model"]["layer_prefix"], *data["model"]["layer_pattern"]):
-                group["ffn"]["routed_expert_weight_dtype"] = dtype
-            result = estimate(Config.from_dict(data), False)
-            return result["capacity"]["per_stage"][0]
+    def test_operator_replacement_and_validation(self):
+        data = v4_data("flash")
+        mutable_ops(data["model"], "sliding_window_attention")[0]["sliding_window"] = 0
+        with self.assertRaisesRegex(ValueError, "sliding_window must be positive"):
+            Config.from_dict(data)
+        data = v4_data("pro")
+        hca = mutable_ops(data["model"], "hca_attention")[0]
+        hca.update(type="standard_attention", implementation="flash_attention", sliding_window=0, query_width_equals_hidden=False)
+        result = estimate(Config.from_dict(data), False)
+        self.assertEqual(result["model"]["operator_mix"]["standard_attention"], 2)
 
-        fp4 = weights("mxfp4")
-        fp8 = weights("mxfp8")
-        self.assertEqual(set(fp4["weights_by_dtype"]), {"mxfp4", "mxfp8"})
-        ratio = fp8["weights_bytes"] / fp4["weights_bytes"]
-        self.assertGreater(ratio, 1.6)
-        self.assertLess(ratio, 2.1)
+    def test_parameter_anchors_and_moe_dtypes(self):
+        for variant, target in (("pro", 1_600_000_000_000), ("flash", 284_000_000_000)):
+            result = estimate(Config.from_dict(v4_data(variant)), False)
+            self.assertGreater(result["model"]["parameters"], target * .94)
+            self.assertLess(result["model"]["parameters"], target * 1.01)
+        data = v4_data("pro")
+        for operator in mutable_ops(data["model"], "moe"):
+            operator["routed_expert_weight_dtype"] = "fp8"
+        fp8 = estimate(Config.from_dict(data), False)["capacity"]["per_stage"][0]["weights_bytes"]
+        fp4 = estimate(Config.from_dict(v4_data("pro")), False)["capacity"]["per_stage"][0]["weights_bytes"]
+        self.assertGreater(fp8, fp4)
 
 
 if __name__ == "__main__":

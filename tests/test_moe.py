@@ -29,6 +29,28 @@ class MoeTests(unittest.TestCase):
         kinds = [item["collective"]["type"] for item in moe["communication"]]
         self.assertEqual(kinds.count("all_to_all"), 2)
 
+    def test_ep_keeps_dense_backbone_batch_but_shrinks_expert_gemm(self):
+        base = estimate(Config.from_dict(self.data), True)
+        ep = estimate(Config.from_dict(parallel(self.data, ep=4)), True)
+
+        def operator(result, type_id):
+            return next(item for item in phase_operators(result["performance"]["prefill"])
+                        if item["type"] == type_id)
+
+        base_attention = operator(base, "standard_attention")
+        ep_attention = operator(ep, "standard_attention")
+        base_qkv = next(item for item in base_attention["suboperators"] if item["name"] == "layers.qkv_projection")
+        ep_qkv = next(item for item in ep_attention["suboperators"] if item["name"] == "layers.qkv_projection")
+        self.assertEqual(ep_qkv["gemm_shape"][0], base_qkv["gemm_shape"][0])
+
+        base_moe = operator(base, "moe")
+        ep_moe = operator(ep, "moe")
+        base_expert = next(item for item in base_moe["suboperators"] if item["name"] == "layers.moe_expert_gate_up")
+        ep_expert = next(item for item in ep_moe["suboperators"] if item["name"] == "layers.moe_expert_gate_up")
+        # Each EP rank owns fewer active experts, so its grouped GEMMs have a
+        # larger per-expert M dimension while its expert weights are sharded.
+        self.assertGreater(ep_expert["gemm_shape"][0], base_expert["gemm_shape"][0])
+
     def test_ep_smaller_than_batch_uses_all_ranks(self):
         data = parallel(self.data, ep=4)
         data["serving"]["batch_size"] = 8

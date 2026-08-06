@@ -1,8 +1,9 @@
-"""Schema v2统一算子组合估算器。"""
+"""Schema v3 有序算子组合估算器。"""
 
 from __future__ import annotations
 
 from dataclasses import replace
+from math import ceil
 from typing import Any
 
 from .capacity import capacity_summary
@@ -28,8 +29,9 @@ def _decode_summary(config, details: bool,
     )
     mean = (first["latency_seconds"] + last["latency_seconds"]) / 2
     total = mean * steps
-    # 稳态吞吐用流水稳态间隔：PP>1时token间可跨Stage流水，间隔受瓶颈Stage限制。
-    steady = (
+    # 单请求自回归的下一步依赖上一token在末Stage的采样结果，不能直接使用
+    # microbatch流水间隔。保留后者作为服务级连续批处理的参考指标。
+    pipeline_service_interval = (
         first["pipeline_schedule"]["steady_state_interval_seconds"]
         + last["pipeline_schedule"]["steady_state_interval_seconds"]
     ) / 2
@@ -40,12 +42,13 @@ def _decode_summary(config, details: bool,
             "mean_seconds": mean,
             "first_seconds": first["latency_seconds"],
             "last_seconds": last["latency_seconds"],
-            "steady_state_seconds": steady,
+            "steady_state_seconds": mean,
+            "pipeline_service_interval_seconds": pipeline_service_interval,
         },
         "first_step": first,
         "last_step": last,
         "performance_complete": first["performance_complete"] and last["performance_complete"],
-        "steady_state_output_tokens_per_second": config.serving.batch_size / steady if steady else None,
+        "steady_state_output_tokens_per_second": config.serving.batch_size / mean if mean else None,
     }, total
 
 
@@ -54,8 +57,7 @@ def _pd_summary(config, prefill_seconds: float, decode_seconds: float,
     deployment = config.deployment
     if deployment.mode != "disaggregated":
         return {"enabled": False, "handoff_visible_seconds": 0.0}
-    critical = capacity["per_stage"][capacity["critical_stage_index"]]
-    payload = critical["persistent_state_bytes"]
+    payload = sum(stage["persistent_state_bytes"] for stage in capacity["per_stage"])
     bandwidth = float(deployment.transfer_bandwidth_bytes_per_second or 1)
     transfer = deployment.transfer_latency_seconds + payload / bandwidth
     combined = max(prefill_seconds, transfer) + deployment.overlap_rho * min(prefill_seconds, transfer)
@@ -63,11 +65,12 @@ def _pd_summary(config, prefill_seconds: float, decode_seconds: float,
     batch = config.serving.batch_size
     prefill_rate = deployment.prefill_replicas * batch / prefill_seconds if prefill_seconds else None
     decode_rate = deployment.decode_replicas * batch / decode_seconds if decode_seconds else None
-    link_rate = bandwidth / payload if payload else None
+    link_rate = 1 / transfer if transfer else None
     candidates = {"prefill_pool": prefill_rate, "decode_pool": decode_rate, "transfer_link": link_rate}
     valid = {key: value for key, value in candidates.items() if value is not None}
     return {
         "enabled": True, "payload_bytes_per_rank": payload,
+        "payload_scope": "all_pipeline_stages_per_rank",
         "transfer_seconds": transfer, "handoff_visible_seconds": visible,
         "max_requests_per_second": candidates,
         "system_max_requests_per_second": min(valid.values()) if valid else None,
@@ -76,22 +79,43 @@ def _pd_summary(config, prefill_seconds: float, decode_seconds: float,
 
 
 def _model_summary(config, capacity: dict[str, Any]) -> dict[str, Any]:
+    """Report the literal operator list; special mechanisms are no longer global state."""
     counts: dict[str, int] = {}
-    layers = config.model.expanded_layers()
-    for layer in layers:
-        # 每层骨架包含2×Norm、1×Attention、1×FFN和2×Residual。
-        for spec in (layer.norm, layer.attention, layer.residual,
-                     layer.norm, layer.ffn, layer.residual):
+    for layer in config.model.expanded_layers():
+        for spec in layer.main_operators:
             counts[spec.type] = counts.get(spec.type, 0) + 1
-    if layers and layers[-1].residual.type == "attnres":
-        counts["attnres"] = counts.get("attnres", 0) + 1
+    metadata = dict(config.model.metadata)
+    special = {
+        type_id: {
+            "occurrences": counts[type_id],
+            "formula_confidence": "approximate",
+            "note": "Independent performance operator; not an executable tensor graph.",
+        }
+        for type_id in ("attnres", "mhc") if type_id in counts
+    }
     return {
         "id": config.model.model_id, "name": config.model.name,
         "layers": config.model.layer_count, "hidden_size": config.model.hidden_size,
         "parameters": capacity["model_logical_parameters"],
         "weight_dtype": config.model.weight_dtype,
-        "operator_mix": counts, "metadata": config.model.metadata,
+        "activation_dtype": config.model.activation_dtype,
+        "kv_cache_dtype": config.model.kv_dtype,
+        "state_dtype": config.model.kda_state_dtype,
+        "operator_mix": counts, "metadata": metadata,
+        "special_operator_estimation": special,
+        "structure_accuracy": metadata.get("structure_accuracy", "unspecified"),
+        "performance_formula_confidence": metadata.get("performance_formula_confidence", "mixed"),
     }
+
+
+def _compute_throughput_fallbacks(phase: dict[str, Any]) -> set[str]:
+    formats: set[str] = set()
+    for stage in phase.get("stages", []):
+        for operator in stage.get("operators", []):
+            for item in operator.get("suboperators", []):
+                if item.get("compute_throughput_source") == "model_default_fallback":
+                    formats.add(str(item.get("compute_dtype") or "unknown"))
+    return formats
 
 
 def estimate_composed(config, details: bool = True, include_scaling: bool = True) -> dict[str, Any]:
@@ -108,7 +132,7 @@ def estimate_composed(config, details: bool = True, include_scaling: bool = True
             "不能解释为严格上界或下界。"
         )
     result: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "model": _model_summary(config, capacity),
         "workload": {
             "batch_size": config.serving.batch_size,
@@ -141,6 +165,16 @@ def estimate_composed(config, details: bool = True, include_scaling: bool = True
         config, "prefill", config.serving.prompt_length, details, stages
     )
     decode, decode_seconds = _decode_summary(config, details, stages)
+    fallback_formats = _compute_throughput_fallbacks(prefill)
+    first_decode = decode.get("first_step")
+    if isinstance(first_decode, dict):
+        fallback_formats |= _compute_throughput_fallbacks(first_decode)
+    if fallback_formats:
+        warnings.append(
+            "硬件缺少计算格式 "
+            + ", ".join(sorted(fallback_formats))
+            + " 的独立吞吐；已显式回退到模型默认吞吐。"
+        )
     complete = prefill["performance_complete"] and decode["performance_complete"] and not incomplete_extra
     result["validity"]["performance_complete"] = complete
     prefill_seconds = prefill["latency_seconds"]
@@ -161,6 +195,7 @@ def estimate_composed(config, details: bool = True, include_scaling: bool = True
             ),
         },
         "pd_disaggregation": pd,
+        "compute_throughput_fallback_formats": sorted(fallback_formats),
         "modeled_proxy_latency_seconds": completion,
         "known_latency_lower_bound_seconds": completion,
     }

@@ -35,15 +35,15 @@ def capacity_summary(config, stages: list[list[object]] | None = None) -> dict[s
     model, serving = config.model, config.serving
     if stages is None:
         stages = balanced_layer_partition(config, model.expanded_layers())
-    active_ep = min(config.parallelism.expert_parallel, serving.batch_size)
-    local_batch = ceil(serving.batch_size / active_ep)
     stage_results = []
     logical_parameters = 0
     tied = bool(model.embedding.get("tied_lm_head", True))
+    layer_start = 0
     for index, layers in enumerate(stages):
         estimates = build_estimates(
-            config, layers, "prefill", local_batch, serving.prompt_length,
+            config, layers, "prefill", serving.batch_size, serving.prompt_length,
             serving.prompt_length, index == 0, index == len(stages) - 1,
+            layer_start,
         )
         local_parameters = sum(item.local_parameters for item in estimates)
         global_parameters = sum(item.global_parameters for item in estimates)
@@ -72,6 +72,15 @@ def capacity_summary(config, stages: list[list[object]] | None = None) -> dict[s
             (request.payload_bytes for item in estimates for request in item.communication_requests),
             default=0,
         )
+        if index < len(stages) - 1:
+            boundary_width = model.state_width_after_layer(layer_start + len(layers) - 1)
+            pipeline_payload = (
+                serving.batch_size * serving.prompt_length * boundary_width
+                * model.activation_bytes
+            )
+            communication = max(communication, pipeline_payload)
+        else:
+            pipeline_payload = 0
         # 峰值按同一算子的临时空间与通信buffer共同存活来估计，避免把
         # 不同执行时刻的两个独立最大值直接相加。
         workspace = max((
@@ -81,6 +90,7 @@ def capacity_summary(config, stages: list[list[object]] | None = None) -> dict[s
             )
             for item in estimates
         ), default=0)
+        workspace = max(workspace, pipeline_payload)
         total = (
             weights + states + ceil(workspace)
             + config.hardware.runtime_reserved_bytes
@@ -107,6 +117,8 @@ def capacity_summary(config, stages: list[list[object]] | None = None) -> dict[s
             "states_by_operator": state_results,
             "activations_peak_bytes": activations,
             "communication_buffer_peak_bytes": ceil(communication),
+            "pipeline_state_payload_bytes": ceil(pipeline_payload),
+            "pipeline_state_width_elements": boundary_width if index < len(stages) - 1 else 0,
             "combined_workspace_peak_bytes": ceil(workspace),
             "runtime_reserved_bytes": config.hardware.runtime_reserved_bytes,
             "baseline_unavailable_bytes": config.hardware.baseline_unavailable_bytes,
@@ -114,6 +126,7 @@ def capacity_summary(config, stages: list[list[object]] | None = None) -> dict[s
             "headroom_bytes": config.hardware.device_memory_capacity_bytes - total,
         })
         logical_parameters += global_parameters
+        layer_start += len(layers)
     # PP物理复制不应重复计入模型的逻辑参数量。
     if tied and len(stages) > 1:
         logical_parameters -= model.padded_vocab_size * model.hidden_size

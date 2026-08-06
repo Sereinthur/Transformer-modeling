@@ -113,9 +113,11 @@ class OperatorCostModel:
                 else execution.decode_gemm_efficiency
             )
         tile_efficiency = self.tile_efficiency(item)
-        effective_compute = (
-            hardware.effective_compute_ops_per_second * efficiency * tile_efficiency
-        )
+        compute_dtype = item.compute_dtype or self.config.model.activation_dtype
+        peak_compute, throughput_source = hardware.compute_throughput(compute_dtype)
+        if peak_compute is None:
+            raise ValueError(f"missing hardware throughput for {compute_dtype}")
+        effective_compute = peak_compute * efficiency * tile_efficiency
         compute_time = item.executed_ops / effective_compute
         memory_time = item.hbm_payload_bytes / self.effective_memory_bandwidth
         launch_time = item.kernel_count * hardware.kernel_launch_latency_seconds
@@ -134,6 +136,8 @@ class OperatorCostModel:
             "kind": item.kind,
             "kernel_count": item.kernel_count,
             "gemm_shape": list(item.gemm_shape) if item.gemm_shape is not None else None,
+            "compute_dtype": compute_dtype,
+            "compute_throughput_source": throughput_source,
             "ops": {
                 "logical": item.logical_ops if item.logical_ops is not None else item.executed_ops,
                 "executed": item.executed_ops,
