@@ -8,7 +8,8 @@
 import { AppState, Bus, EVENTS, findNodeById } from './api.js';
 import {
     categoryOf, insertLayerOperation, moveLayerOperation, removeLayerOperation,
-    setLayerGroupKind, setPatternCycleCount, updateNodeField, updateNodeParams, updateNodeType, selectNode,
+    setLayerGroupKind, setModelLayerCount, setPatternCycleCount, updateModelInfo,
+    updateNodeField, updateNodeParams, updateNodeType, selectNode,
 } from './flowchart.js';
 
 let bodyEl = null;
@@ -143,6 +144,104 @@ function buildEmptyState() {
     return wrap;
 }
 
+/** Render the one authoritative editor for model-wide dimensions and defaults. */
+export function renderModelSettings() {
+    if (!bodyEl) return;
+    const info = AppState.flowchart?.model_info;
+    if (!info) return;
+    bodyEl.innerHTML = '';
+    if (tagEl) tagEl.textContent = '模型全局设置';
+
+    const dimensions = sectionEl('模型尺寸');
+    dimensions.append(
+        buildTextRow({
+            label: '模型名称', value: info.name ?? '', code: 'model.name',
+            onChange: (value) => {
+                updateModelInfo({ name: value });
+                renderModelSettings();
+            },
+        }),
+        buildNumberRow({
+            label: '总层数', value: Number(info.layer_count ?? 1), min: 1, step: 1,
+            code: 'model.dimensions.layer_count',
+            hint: '循环 Pattern 会按此总层数展开。',
+            onChange: (value) => {
+                setModelLayerCount(Math.max(1, Math.round(value)));
+                renderModelSettings();
+            },
+        }),
+    );
+    for (const [key, label] of [
+        ['hidden_size', '隐藏维度'], ['intermediate_size', '默认 FFN 中间维度'],
+        ['vocab_size', '词表大小'], ['padded_vocab_size', '对齐词表大小'],
+    ]) {
+        dimensions.appendChild(buildNumberRow({
+            label, value: Number(info[key] ?? 1), min: 1, step: 1,
+            code: `model.dimensions.${key}`,
+            onChange: (value) => {
+                const next = Math.max(1, Math.round(value));
+                if (key === 'vocab_size') {
+                    updateModelInfo({ vocab_size: next, padded_vocab_size: Math.max(next, Number(info.padded_vocab_size ?? 0)) });
+                } else if (key === 'padded_vocab_size') {
+                    updateModelInfo({ padded_vocab_size: Math.max(next, Number(info.vocab_size ?? 1)) });
+                } else {
+                    updateModelInfo({ [key]: next });
+                }
+                renderModelSettings();
+            },
+        }));
+    }
+
+    const dtype = { ...(info.dtype ?? {}) };
+    const precision = sectionEl('模型默认精度');
+    const choices = {
+        weight: ['fp32', 'bf16', 'fp16', 'fp8', 'mxfp8', 'mxfp4'],
+        activation: ['fp32', 'bf16', 'fp16', 'fp8', 'mxfp8'],
+        kv_cache: ['fp32', 'bf16', 'fp16', 'fp8', 'mxfp8'],
+        accumulation: ['fp32', 'bf16', 'fp16', 'fp8'],
+        logits: ['fp32', 'bf16', 'fp16', 'fp8'],
+        state: ['fp32', 'bf16', 'fp16', 'fp8', 'mxfp8'],
+    };
+    const labels = {
+        weight: '默认权重精度', activation: '激活精度', kv_cache: '默认 KV Cache 精度',
+        accumulation: '累加精度', logits: 'Logits 精度', state: '状态精度',
+    };
+    for (const key of Object.keys(choices)) {
+        precision.appendChild(buildSelectRow({
+            label: labels[key], value: dtype[key] ?? choices[key][0], options: choices[key],
+            code: `model.dtype.${key}`,
+            onChange: (value) => {
+                updateModelInfo({ dtype: { ...dtype, [key]: value } });
+                renderModelSettings();
+            },
+        }));
+    }
+
+    const quantization = { ...(info.quantization ?? {}) };
+    const quantizationSection = sectionEl('量化元数据');
+    quantizationSection.append(
+        buildNumberRow({
+            label: '量化块大小', value: Number(quantization.block_size ?? 32), min: 1, step: 1,
+            code: 'model.quantization.block_size',
+            onChange: (value) => {
+                updateModelInfo({ quantization: { ...quantization, block_size: Math.max(1, Math.round(value)) } });
+                renderModelSettings();
+            },
+        }),
+        buildNumberRow({
+            label: '每块 Scale 字节数', value: Number(quantization.scale_bytes ?? 1), min: 0, step: 1,
+            code: 'model.quantization.scale_bytes',
+            onChange: (value) => {
+                updateModelInfo({ quantization: { ...quantization, scale_bytes: Math.max(0, Math.round(value)) } });
+                renderModelSettings();
+            },
+        }),
+    );
+
+    const hint = hintEl('这里是模型的唯一全局编辑入口；单个算子仍可在自身参数中覆盖权重或 KV Cache 精度。');
+    bodyEl.append(dimensions, precision, quantizationSection, hint);
+}
+
 /**
  * Embedding 的形状来自模型维度；算子卡可以覆盖表行数和权重精度，但
  * 在当前 decoder-only 线性主干中，输出宽度必须接到同一个 hidden state。
@@ -249,7 +348,9 @@ function buildHeader(node, schema, category) {
     const name = document.createElement('h3');
     name.textContent = schema?.chinese_name ?? node.label ?? node.type ?? node.id;
     const code = document.createElement('code');
-    code.textContent = node.type ?? '—';
+    // Long registered type IDs such as minimax_sparse_attention must remain
+    // readable in the fixed-width inspector rather than being visually clipped.
+    code.textContent = node.type ? node.type.replaceAll('_', '_\u200b') : '—';
     title.append(name, code);
     head.appendChild(title);
 

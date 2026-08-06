@@ -175,7 +175,7 @@ class MoEOperator(TransformerOperator):
         ba = effective_element_bytes(ctx.config, model.activation_dtype)
         brw = effective_element_bytes(ctx.config, rdtype)
         global_assignments = ctx.rows * topk
-        active_ep_ranks = min(ctx.ep, ctx.batch_size)
+        active_ep_ranks = min(ctx.ep, global_assignments)
         # Dense backbone inputs are replicated across EP ranks.  Only routed
         # expert work is divided after the idealized all-to-all dispatch.
         assignments = ceil(global_assignments / active_ep_ranks)

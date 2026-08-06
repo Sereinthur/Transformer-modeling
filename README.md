@@ -48,6 +48,9 @@ python -m venv .venv
 Windows 用户双击 `start_visual_app.bat`。首次运行会创建项目内 `.venv` 并自动安装依赖；
 之后直接打开桌面窗口。本地 HTTP 服务只用于应用内部通信。
 
+界面右上角的 `导入` / `导出` 用于保存和恢复完整建模配置：`导出` 将当前模型结构、硬件、
+请求和并行参数写成 JSON 文件；`导入` 从此前导出的 JSON 恢复这些设置，不会上传数据或访问网络。
+
 模型页包含 Prefix、循环 Pattern 与 Suffix 的有序算子编辑器。每个层段可设置重复次数；每个算子均可插入、删除、移动、替换并独立编辑参数。KDA、MLA、AttnRes、mHC、MoE 与 MXFP 参数不依赖具体模型预设。
 
 开发者可将程序打包为 Windows 可执行文件：
@@ -97,6 +100,19 @@ k3 = resolve_model_definition(preset_id="kimi-k3-official")
 ```
 
 `Config`只接受 `schema_version=3`。旧的固定四槽位配置、`hidden_state_flow` 与 `residual_connections` 都会明确报“配置版本已过期”，不会被隐式转换。
+
+内置模型的场景示例使用顶层 `preset_id`，模型结构由内置 catalog 统一提供；`Config.from_dict()`、CLI 和可视化估算都会自动展开它。完整的 `model` 段只用于自定义模型或冻结归档，且不能与 `preset_id` 同时出现：
+
+```json
+{
+  "schema_version": 3,
+  "preset_id": "kimi-k3-official",
+  "hardware": {"...": "..."},
+  "serving": {"...": "..."},
+  "execution": {"...": "..."},
+  "parallelism": {"...": "..."}
+}
+```
 
 ## Schema v3 示例
 
@@ -257,6 +273,7 @@ S = M_local × TopK × H × activation_bytes
 - Qwen3-30B-A3B：标准 Attention + MoE，作为通用线性编辑起点。
 - Kimi K3官方配置对齐版（`kimi-k3-official`）：93层，69×KDA + 24×Gated MLA，首层Dense SiTU-GLU、其余92层LatentMoE；第93层固定为MLA，Block AttnRes边界为L1/L13/…/L85。
 - DeepSeek-V4（`deepseek-v4-pro`、`deepseek-v4-flash`）：Pro为31 HCA + 30 CSA + 0纯滑窗；Flash为2纯滑窗 + 20 HCA + 21 CSA；两者均为0 Standard Attention。每个 Block 在 Attention 和 MoE 后各使用一次 mHC，替代普通 Residual。
+- MiniMax-M3（`minimax-m3`）：60层，前3层为 Full GQA + Dense SwiGLU，后57层为 128 routed + 1 shared、top-4 sigmoid MoE 与 MSA。MSA 将KV按128-token block分组，4头Indexer按max score选择Top-16 block（local block包含在该预算内），再在选中块上执行精确GQA Softmax Attention。
 
 本地网页接口：
 
@@ -271,6 +288,8 @@ S = M_local × TopK × H × activation_bytes
 DeepSeek-V4预设按官方配置和推理实现对齐文本主干：Pro对账到1.6T参数、Flash对账到284B。CSA/HCA都包含本地128滑窗分支，只有CSA包含Indexer；MTP作为已知外围模块展示但不进入性能估算。压缩Attention与mHC的性能公式仍明确标为近似，各算子的 `assumptions` 列出压缩比、top-k命中数与Sinkhorn融合等口径。
 
 Kimi K3预设来自官方 `config.json` 与 `modeling_kimi_linear.py`，层数、层序、注意力类型、Dense/MoE分布和关键维度按公开字段对齐；参数锚点为2.78T。MoonViT/PatchMerger与DSpark作为已知外围模块展示但不进入估算；修改预设的算子列表或关键参数后应视为基于官方配置的自定义模型。
+
+MiniMax-M3预设按 `MiniMaxAI/MiniMax-M3` 的公开 `config.json` 对齐：hidden 6144、64 Q / 4 KV heads、head_dim 128、128 routed experts + 1 shared expert、top-4、1M上下文、BF16权重。MSA的主注意力与Indexer扫描、独立Index-K cache均已计入；Gemma-style RMSNorm、per-head QK Norm、Partial RoPE、routing correction bias、视觉塔/投影器和7个MTP模块保持架构注记但不单独进入性能公式。MSA机制参考 [MiniMax Sparse Attention](https://arxiv.org/abs/2606.13392)。
 
 ## 项目结构
 
@@ -298,7 +317,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 前端语法检查：
 
 ```powershell
-Get-ChildItem transformer_modeling\visual_app\static -Recurse -Filter *.js | ForEach-Object { Get-Content -Raw -Encoding UTF8 $_.FullName | node --input-type=module --check }
+Get-ChildItem transformer_modeling\visual_app\static -Recurse -Filter *.js | ForEach-Object { cmd /d /c "node --input-type=module --check < `"$($_.FullName)`"" }
 ```
 
 测试覆盖单算子、有序 Pattern、K3 2.8T容量、KDA/MLA状态、AttnRes状态与PP载荷、TP Shape、四种拓扑、PP划分、EP All-to-All、容量不足继续计算、网页API和ES Module语法，以及DeepSeek-V4的层排列、Hash路由、压缩KV容量、mHC参数/四通道PP状态和按精度分桶的权重字节。

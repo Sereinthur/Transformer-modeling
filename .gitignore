@@ -8,6 +8,17 @@ transformer_modeling.egg-info/
 dist/
 build/
 .venv/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.coverage
+htmlcov/
+.idea/
+.vscode/
 
 # 估算输出（可用 CLI 重新生成）
 examples/*.result.json

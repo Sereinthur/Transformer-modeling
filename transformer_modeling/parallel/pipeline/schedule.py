@@ -53,7 +53,6 @@ def pipeline_schedule(
             send_finishes[stage][microbatch] = max(
                 finishes[stage][microbatch], link_ready
             ) + stage_send_seconds[stage]
-
     makespan = send_finishes[-1][-1]
     round_trip = send_finishes[-1][0]  # 单个microbatch的全程延迟
     busy_slot_seconds = microbatches * sum(stage_compute_seconds) #所有stage实际工作总时间
@@ -79,12 +78,3 @@ def pipeline_schedule(
         "balanced_pipeline_efficiency": microbatches / (microbatches + stage_count - 1),
         "completion_matrix_seconds": finishes,
     }
-
-
-def _stage_ranges(partition: list[int]) -> list[tuple[int, int]]:
-    ranges: list[tuple[int, int]] = []
-    start = 0
-    for count in partition:
-        ranges.append((start, start + count - 1))
-        start += count
-    return ranges

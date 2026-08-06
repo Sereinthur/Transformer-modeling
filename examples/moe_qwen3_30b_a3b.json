@@ -1,138 +1,21 @@
 {
-  "_说明": "Qwen3-30B-A3B MoE单芯片解析示例；全部专家权重常驻，未启用Expert Parallel。",
+  "_说明": "Qwen3-30B-A3B MoE单芯片解析示例；模型结构由内置 preset_id 提供。",
   "schema_version": 3,
+  "preset_id": "qwen3-30b-a3b",
   "hardware": {
     "name": "example_100t_80g_accelerator",
     "device_count": 1,
-    "compute": {
-      "throughput": {
-        "bf16_dense_ops_per_second": 100000000000000
-      },
-      "matrix_tile": {
-        "m": 16,
-        "n": 16,
-        "k": 16
-      }
-    },
-    "device_memory": {
-      "type": "HBM",
-      "capacity_bytes": 85899345920,
-      "peak_bandwidth_bytes_per_second": 2000000000000,
-      "reserved_capacity_bytes": 1073741824
-    },
-    "runtime": {
-      "kernel_launch_latency_seconds": 5e-06
-    },
-    "interconnect": {
-      "topology": "ring",
-      "effective_channel_bandwidth_bytes_per_second": 100000000000,
-      "collective_step_latency_seconds": 2e-06
-    }
+    "compute": {"throughput": {"bf16_dense_ops_per_second": 100000000000000}, "matrix_tile": {"m": 16, "n": 16, "k": 16}},
+    "device_memory": {"type": "HBM", "capacity_bytes": 85899345920, "peak_bandwidth_bytes_per_second": 2000000000000, "reserved_capacity_bytes": 1073741824},
+    "runtime": {"kernel_launch_latency_seconds": 5e-06},
+    "interconnect": {"topology": "ring", "effective_channel_bandwidth_bytes_per_second": 100000000000, "collective_step_latency_seconds": 2e-06}
   },
-  "model": {
-    "id": "decoder_only",
-    "name": "decoder_only",
-    "dimensions": {
-      "layer_count": 48,
-      "hidden_size": 2048,
-      "intermediate_size": 6144,
-      "vocab_size": 151936,
-      "padded_vocab_size": 151936
-    },
-    "embedding": {
-      "type": "token_embedding",
-      "tied_lm_head": false
-    },
-    "layer_pattern": [
-      {
-        "repeat": 1,
-        "operations": [
-          {"id": "norm_pre", "operator": {"type": "rms_norm"}},
-          {"id": "attention", "operator": {"type": "standard_attention", "implementation": "flash_attention", "query_heads": 32, "kv_heads": 4, "head_dim": 128, "query_width_equals_hidden": false}},
-          {"id": "residual_attention", "operator": {"type": "standard_residual"}},
-          {"id": "norm_post", "operator": {"type": "rms_norm"}},
-          {"id": "moe", "operator": {"type": "moe", "implementation": "standard_moe", "expert_count": 128, "experts_per_token": 8, "expert_intermediate_size": 768, "shared_expert_intermediate_size": 0, "activation": "swiglu"}},
-          {"id": "residual_moe", "operator": {"type": "standard_residual"}}
-        ]
-      }
-    ],
-    "output": {
-      "norm": {
-        "type": "rms_norm"
-      },
-      "head": {
-        "type": "lm_head"
-      },
-      "sampling": {
-        "type": "sampling"
-      }
-    },
-    "dtype": {
-      "weight": "bf16",
-      "activation": "bf16",
-      "kv_cache": "bf16",
-      "state": "bf16",
-      "accumulation": "fp32",
-      "logits": "fp32"
-    },
-    "inference": {
-      "prefill_logits_mode": "last_token"
-    },
-    "quantization": {
-      "block_size": 32,
-      "scale_bytes": 1
-    },
-    "metadata": {
-      "family": "decoder_only",
-      "mapping_quality": "migrated_example",
-      "unsupported_features": []
-    }
-  },
-  "serving": {
-    "batch_size": 1,
-    "prompt_length": {
-      "distribution": "fixed",
-      "value": 2048
-    },
-    "output_length": {
-      "distribution": "fixed",
-      "value": 128
-    },
-    "max_sequence_length": 40960
-  },
+  "serving": {"batch_size": 1, "prompt_length": {"distribution": "fixed", "value": 2048}, "output_length": {"distribution": "fixed", "value": 128}, "max_sequence_length": 40960},
   "execution": {
-    "fusion": {
-      "flash_attention": true,
-      "rope_kv_write": true,
-      "gated_mlp": true,
-      "rmsnorm_linear": true
-    },
-    "overlap": {
-      "mode": "bounded_interpolation",
-      "interpolation_rho": 0.15,
-      "tp_interpolation_rho": 1.0,
-      "prefill_tp_interpolation_rho": 0.5,
-      "decode_tp_interpolation_rho": 1.0
-    },
-    "efficiencies": {
-      "_说明": "参考公开MoE服务结果采用的保守经验初值；高并发排队与负载不均衡未折入效率。",
-      "prefill_gemm": 0.55,
-      "decode_gemm": 0.15,
-      "prefill_attention": 0.42,
-      "decode_attention": 0.12,
-      "vector": 0.12,
-      "hbm": 0.72
-    },
-    "memory": {
-      "kv_paged": true,
-      "kv_page_tokens": 16
-    }
+    "fusion": {"flash_attention": true, "rope_kv_write": true, "gated_mlp": true, "rmsnorm_linear": true},
+    "overlap": {"mode": "bounded_interpolation", "interpolation_rho": 0.15, "tp_interpolation_rho": 1.0, "prefill_tp_interpolation_rho": 0.5, "decode_tp_interpolation_rho": 1.0},
+    "efficiencies": {"_说明": "参考公开MoE服务结果采用的保守经验初值；高并发排队与负载不均衡未折入效率。", "prefill_gemm": 0.55, "decode_gemm": 0.15, "prefill_attention": 0.42, "decode_attention": 0.12, "vector": 0.12, "hbm": 0.72},
+    "memory": {"kv_paged": true, "kv_page_tokens": 16}
   },
-  "parallelism": {
-    "tensor_parallel": 1,
-    "pipeline_parallel": 1,
-    "pipeline_microbatches": 1,
-    "kv_head_policy": "shard_or_group_replicate",
-    "expert_parallel": 1
-  }
+  "parallelism": {"tensor_parallel": 1, "pipeline_parallel": 1, "pipeline_microbatches": 1, "kv_head_policy": "shard_or_group_replicate", "expert_parallel": 1}
 }

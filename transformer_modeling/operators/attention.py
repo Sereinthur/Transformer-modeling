@@ -115,9 +115,9 @@ class StandardAttentionOperator(TransformerOperator):
             pairs = windowed_pairs(length, window)
             logical = 4 * ctx.batch_size * q * pairs * count
             sparsity = pairs / (length * (length + 1) / 2)
-            executed = logical if flash else round(
-                4 * ctx.batch_size * length * length * q * count * sparsity
-            )
+            # FlashAttention changes materialization and kernel behavior, not
+            # the mathematical QK^T + AV FLOP count.
+            executed = logical
             cache_tokens = length
         else:
             visible = windowed_tokens(ctx.attention_length, window)

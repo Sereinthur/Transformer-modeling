@@ -47,9 +47,10 @@ class MoeTests(unittest.TestCase):
         ep_moe = operator(ep, "moe")
         base_expert = next(item for item in base_moe["suboperators"] if item["name"] == "layers.moe_expert_gate_up")
         ep_expert = next(item for item in ep_moe["suboperators"] if item["name"] == "layers.moe_expert_gate_up")
-        # Each EP rank owns fewer active experts, so its grouped GEMMs have a
-        # larger per-expert M dimension while its expert weights are sharded.
-        self.assertGreater(ep_expert["gemm_shape"][0], base_expert["gemm_shape"][0])
+        # Expert assignment is repartitioned across EP ranks while the dense
+        # backbone keeps its original batch shape. The local grouped-GEMM M
+        # dimension can remain equal when active experts scale with EP.
+        self.assertGreaterEqual(ep_expert["gemm_shape"][0], base_expert["gemm_shape"][0])
 
     def test_ep_smaller_than_batch_uses_all_ranks(self):
         data = parallel(self.data, ep=4)
@@ -62,8 +63,17 @@ class MoeTests(unittest.TestCase):
         data = parallel(self.data, ep=8)
         data["serving"]["batch_size"] = 2
         phase = estimate(Config.from_dict(data), False)["performance"]["prefill"]
-        self.assertEqual(phase["active_ep_ranks"], 2)
-        self.assertEqual(phase["ep_utilization"], 0.25)
+        # Routing is token-granular: two decode tokens with top-k=8 can keep
+        # all eight EP ranks busy even though batch_size is only two.
+        self.assertEqual(phase["active_ep_ranks"], 8)
+        self.assertEqual(phase["ep_utilization"], 1)
+
+    def test_long_prefill_uses_available_ep_ranks(self):
+        data = parallel(self.data, ep=8)
+        data["serving"]["batch_size"] = 1
+        phase = estimate(Config.from_dict(data), False)["performance"]["prefill"]
+        self.assertEqual(phase["active_ep_ranks"], 8)
+        self.assertEqual(phase["ep_utilization"], 1)
 
     def test_invalid_expert_and_tp_divisibility(self):
         data = parallel(self.data, ep=3)

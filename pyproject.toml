@@ -20,5 +20,8 @@ desktop-build = ["pywebview>=5.4", "pyinstaller>=6.0"]
 transformer-model = "transformer_modeling.cli:main"
 transformer-model-visual = "transformer_modeling.visual_app.server:main"
 
+[tool.setuptools.package-data]
+"transformer_modeling.visual_app" = ["static/**/*"]
+
 [tool.setuptools.packages.find]
 include = ["transformer_modeling*"]

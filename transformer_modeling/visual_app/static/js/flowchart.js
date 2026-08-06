@@ -563,6 +563,17 @@ export function setModelLayerCount(value) {
     return true;
 }
 
+/** Update global model metadata that is serialized with the flowchart. */
+export function updateModelInfo(updates) {
+    const flowchart = AppState.flowchart;
+    if (!flowchart || !updates || typeof updates !== 'object') return false;
+    flowchart.model_info = { ...(flowchart.model_info ?? {}), ...updates };
+    markArchitectureCustomized();
+    renderFlowchart();
+    Bus.emit(EVENTS.FLOWCHART_CHANGED, { reason: 'model_info' });
+    return true;
+}
+
 /**
  * 设置循环单元的完整重复次数。它对应的是 V4 的「[HCA → CSA] ×29」
  * 或 K3 的「[KDA ×3 → MLA] ×22」，而不是某个算子在单元内的 ×N。

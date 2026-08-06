@@ -2,16 +2,23 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
-if exist ".venv\Scripts\python.exe" goto run
+if exist ".venv\Scripts\python.exe" goto check_environment
 
-where py >nul 2>&1
-if not errorlevel 1 (
-  py -3 -m venv .venv
-) else (
+set "PYTHON="
+for %%V in (3.14 3.13 3.12 3.11 3.10) do (
+  if not defined PYTHON (
+    py -%%V -c "import sys" >nul 2>&1
+    if not errorlevel 1 set "PYTHON=py -%%V"
+  )
+)
+if not defined PYTHON (
   where python >nul 2>&1
   if errorlevel 1 goto missing_python
-  python -m venv .venv
+  python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+  if errorlevel 1 goto missing_python
+  set "PYTHON=python"
 )
+%PYTHON% -m venv .venv
 if errorlevel 1 goto failed
 
 echo Installing desktop dependencies. This only happens on first launch.
@@ -21,6 +28,10 @@ if errorlevel 1 goto failed
 if errorlevel 1 goto failed
 ".venv\Scripts\python.exe" -m pip install -e ".[desktop]"
 if errorlevel 1 goto failed
+
+:check_environment
+".venv\Scripts\python.exe" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+if errorlevel 1 goto incompatible_environment
 
 :run
 ".venv\Scripts\python.exe" -c "import webview" >nul 2>&1
@@ -36,6 +47,12 @@ exit /b 0
 :missing_python
 echo Python 3.10 or later was not found.
 echo Install it from https://www.python.org/downloads/ and enable Add Python to PATH.
+pause
+exit /b 1
+
+:incompatible_environment
+echo The existing .venv uses Python older than 3.10.
+echo Delete the .venv folder, then run this file again with Python 3.10 or later.
 pause
 exit /b 1
 

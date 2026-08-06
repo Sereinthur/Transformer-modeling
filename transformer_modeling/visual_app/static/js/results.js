@@ -83,7 +83,7 @@ export function renderResults(results) {
     grid.appendChild(capCard);
 
     /* --- 性能指标 --- */
-    const perfCard = card('性能指标', theoretical ? '容量不可行，以下为理论值' : '端到端时延与吞吐');
+    const perfCard = card('性能指标', '端到端时延与吞吐');
     perfCard.appendChild(metricRow([
         metric('TTFT 首 token', secondsToMs(ttft), 'ms', 'perf-ttft'),
         metric('TPOT 单步解码', secondsToMs(tpot), 'ms', 'perf-tpot'),
@@ -137,8 +137,13 @@ export function renderResults(results) {
     bodyEl.appendChild(grid);
 
     /* --- 警告 --- */
-    const warnings = data.warnings ?? [];
-    if (warnings.length) bodyEl.appendChild(buildWarnings(warnings));
+    const warnings = distinctWarnings(data.warnings);
+    // Capacity feasibility is already presented once in the verdict banner and
+    // capacity card. Keep the API/CLI warning, but do not repeat it in the UI.
+    const additionalWarnings = feasible ? warnings : warnings.filter(
+        (warning) => !isCapacityWarning(warning),
+    );
+    if (additionalWarnings.length) bodyEl.appendChild(buildWarnings(additionalWarnings));
 
     /* --- 算子级分解（逐 PP Stage 展平）--- */
     const prefillPhase = getPath(data, 'performance.prefill');
@@ -269,12 +274,27 @@ function buildCapacityFooter({ total, available, shortfall, headroom, feasible }
     return kvList(rows);
 }
 
+function distinctWarnings(warnings) {
+    const seen = new Set();
+    return (Array.isArray(warnings) ? warnings : []).filter((warning) => {
+        const text = typeof warning === 'string' ? warning.trim() : safeJson(warning);
+        if (!text || seen.has(text)) return false;
+        seen.add(text);
+        return true;
+    });
+}
+
+function isCapacityWarning(warning) {
+    return typeof warning === 'string'
+        && /容量不足|容量超限|容量不可行|理论值/.test(warning);
+}
+
 function buildWarnings(warnings) {
     const box = document.createElement('div');
     box.className = 'warn-box';
     const title = document.createElement('h4');
     title.className = 'section-title';
-    title.textContent = `告警（${warnings.length}）`;
+    title.textContent = `其他告警（${warnings.length}）`;
     box.appendChild(title);
     const list = document.createElement('ul');
     list.className = 'warn-list';

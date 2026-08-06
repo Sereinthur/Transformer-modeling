@@ -2,12 +2,17 @@ import copy
 import unittest
 
 from transformer_modeling import Config, estimate
+from transformer_modeling.models import get_preset
 
 from helpers import example, parallel, phase_operators
 
 
 def latent_data(tp=1, ep=1):
-    return parallel(example("kimi_k3_base_tp64"), tp=tp, ep=ep)
+    data = example("kimi_k3_base_tp64")
+    # This test deliberately edits the preset's MoE operators for comparison.
+    data["model"] = get_preset("kimi-k3-official")["model"]
+    data.pop("preset_id")
+    return parallel(data, tp=tp, ep=ep)
 
 
 def equivalent_width(data):

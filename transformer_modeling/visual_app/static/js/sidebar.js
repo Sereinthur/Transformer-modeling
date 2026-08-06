@@ -16,7 +16,7 @@ import {
     hintEl, sectionEl,
 } from './operator-panel.js';
 
-const TABS = ['model', 'hardware', 'serving', 'execution', 'parallelism'];
+const TABS = ['hardware', 'serving', 'execution', 'parallelism'];
 
 /* ---------------------------------------------------------------- 字段描述表 */
 
@@ -28,29 +28,6 @@ const TABS = ['model', 'hardware', 'serving', 'execution', 'parallelism'];
  *   factor  界面值 → config 原始值 的乘数
  */
 const FIELD_GROUPS = {
-    model: [
-        {
-            title: '模型尺寸',
-            fields: [
-                { path: 'model.name', label: '模型名称', type: 'text', fallback: 'Custom Transformer' },
-                { path: 'model.dimensions.layer_count', label: '总层数', type: 'int', min: 1, fallback: 1 },
-                { path: 'model.dimensions.hidden_size', label: '隐藏维度', type: 'int', min: 1, fallback: 4096 },
-                { path: 'model.dimensions.intermediate_size', label: '默认 FFN 中间维度', type: 'int', min: 1, fallback: 11008 },
-                { path: 'model.dimensions.vocab_size', label: '词表大小', type: 'int', min: 1, fallback: 32000 },
-                { path: 'model.dimensions.padded_vocab_size', label: '对齐词表大小', type: 'int', min: 1, fallback: 32000 },
-            ],
-        },
-        {
-            title: '模型精度',
-            fields: [
-                { path: 'model.dtype.weight', label: '默认权重精度', type: 'select', options: ['fp32', 'bf16', 'fp16', 'fp8', 'mxfp8', 'mxfp4'], fallback: 'bf16' },
-                { path: 'model.dtype.activation', label: '激活精度', type: 'select', options: ['fp32', 'bf16', 'fp16', 'fp8', 'mxfp8'], fallback: 'bf16' },
-                { path: 'model.dtype.kv_cache', label: '默认 KV Cache 精度', type: 'select', options: ['fp32', 'bf16', 'fp16', 'fp8', 'mxfp8'], fallback: 'bf16' },
-                { path: 'model.dtype.logits', label: 'Logits 精度', type: 'select', options: ['fp32', 'bf16', 'fp16', 'fp8'], fallback: 'fp32' },
-                { path: 'model.dtype.state', label: '状态精度', type: 'select', options: ['fp32', 'bf16', 'fp16', 'fp8', 'mxfp8'], fallback: 'bf16' },
-            ],
-        },
-    ],
     hardware: [
         {
             title: '芯片与算力',
@@ -229,7 +206,6 @@ const FIELD_GROUPS = {
 };
 
 const TAB_HINTS = {
-    model: '模型尺寸和默认精度会传入后端配置。算子卡中的空白覆盖字段会继承这里的值。',
     hardware: '硬件规格直接决定算力与带宽上限；单位已换算为工程常用口径。',
     serving: '请求形状决定 prefill / decode 的工作量与 KV 缓存占用。',
     execution: '融合、重叠与效率系数刻画真实执行相对理论峰值的折扣。',
@@ -240,7 +216,7 @@ const TAB_HINTS = {
 
 let bodyEl = null;
 let tabsEl = null;
-let activeTab = 'model';
+let activeTab = 'hardware';
 
 /** 初始化左侧栏 */
 export function initSidebar(container, tabsContainer) {
@@ -270,7 +246,6 @@ export function switchTab(tab) {
  */
 export function loadFromConfig(config) {
     AppState.sidebarConfig = {
-        model: deepClone(config?.model ?? {}),
         hardware: deepClone(config?.hardware ?? {}),
         serving: deepClone(config?.serving ?? {}),
         execution: deepClone(config?.execution ?? {}),
@@ -421,30 +396,8 @@ function writeRaw(field, rawValue) {
         const alt = getPath(config, field.altPath);
         if (alt !== undefined && (typeof alt !== 'object' || alt === null)) targetPath = field.altPath;
     }
-    let value = rawValue;
-    let synchronized = false;
-    if (targetPath === 'model.dimensions.padded_vocab_size') {
-        const vocab = Number(getPath(config, 'model.dimensions.vocab_size') ?? 0);
-        if (Number(value) < vocab) {
-            value = vocab;
-            synchronized = true;
-            Bus.emit(EVENTS.TOAST, {
-                type: 'info', message: `对齐词表不能小于词表大小，已调整为 ${vocab}。`,
-            });
-        }
-    }
-    setPath(config, targetPath, value);
-    if (targetPath === 'model.dimensions.vocab_size') {
-        const paddedPath = 'model.dimensions.padded_vocab_size';
-        const padded = Number(getPath(config, paddedPath) ?? 0);
-        if (padded < Number(value)) {
-            setPath(config, paddedPath, Number(value));
-            synchronized = true;
-            Bus.emit(EVENTS.CONFIG_CHANGED, { path: paddedPath, value: Number(value) });
-        }
-    }
-    Bus.emit(EVENTS.CONFIG_CHANGED, { path: targetPath, value });
-    if (synchronized) render();
+    setPath(config, targetPath, rawValue);
+    Bus.emit(EVENTS.CONFIG_CHANGED, { path: targetPath, value: rawValue });
 }
 
 /** 取路径末段作为字段代码展示 */

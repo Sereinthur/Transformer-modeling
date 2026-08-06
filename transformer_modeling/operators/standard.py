@@ -229,7 +229,7 @@ class MHCOperator(TransformerOperator):
         parameters = layer_parameters * count + head_parameters
         linear_ops = 2 * rows * hc_width * mix_width
         pre_post_ops = 2 * rows * h * (channels + channels * channels + channels)
-        sinkhorn_ops = 4 * rows * channels * channels * max(1, iters)
+        sinkhorn_ops = 4 * rows * channels * channels * iters
         ops = (linear_ops + pre_post_ops + sinkhorn_ops) * count
         if ctx.include_output:
             ops += 2 * rows * hc_width * channels + 2 * rows * h * channels

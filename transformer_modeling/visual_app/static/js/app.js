@@ -8,12 +8,12 @@ import {
     flowchartToConfig, resolvePreset, runEstimate,
 } from './api.js';
 import {
-    fitView, initFlowchart, renderFlowchart, resetNodeOffsets, setAllGroupsCollapsed, setModelLayerCount, zoomBy,
+    fitView, initFlowchart, renderFlowchart, resetNodeOffsets, setAllGroupsCollapsed, zoomBy,
 } from './flowchart.js';
 import {
     LINEAR_LAYOUT_DEFAULTS, applyLinearLayoutOverrides, getLinearLayout, resetLinearLayout,
 } from './layout.js';
-import { initOperatorPanel, renderOperatorPanel } from './operator-panel.js';
+import { initOperatorPanel, renderModelSettings, renderOperatorPanel } from './operator-panel.js';
 import { getSidebarConfig, initSidebar, loadFromConfig } from './sidebar.js';
 import { initResults, renderResults } from './results.js';
 
@@ -102,6 +102,7 @@ function cacheDom() {
     dom.presetDesc = document.getElementById('preset-desc');
     dom.btnCompute = document.getElementById('btn-compute');
     dom.btnImport = document.getElementById('btn-import');
+    dom.btnModelSettings = document.getElementById('btn-model-settings');
     dom.btnExport = document.getElementById('btn-export');
     dom.fileImport = document.getElementById('file-import');
     dom.workspace = document.getElementById('workspace');
@@ -219,35 +220,14 @@ function renderModelInfo(info) {
         ['inter', info.intermediate_size],
         ['vocab', info.vocab_size],
     ];
-    const layers = document.createElement('label');
+    const layers = document.createElement('span');
     layers.className = 'mi-chip mi-layer-count';
     const layersLabel = document.createElement('em');
     layersLabel.textContent = '层数';
-    const layersInput = document.createElement('input');
-    layersInput.type = 'number';
-    layersInput.min = String(
-        (info.structure?.prefix_layer_count ?? info.prefix_layer_count ?? 0)
-        + (info.structure?.suffix_layer_count ?? info.suffix_layer_count ?? 0) + 1,
-    );
-    layersInput.step = '1';
-    layersInput.value = String(info.layer_count ?? 1);
-    layersInput.title = '总层数：循环 Pattern 会按此值展开，最后一轮可截断';
-    const applyLayerCount = () => {
-        if (!setModelLayerCount(layersInput.value)) {
-            layersInput.value = String(AppState.flowchart?.model_info?.layer_count ?? info.layer_count);
-            return;
-        }
-        renderModelInfo(AppState.flowchart?.model_info);
-    };
-    layersInput.addEventListener('change', applyLayerCount);
-    layersInput.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter') {
-            event.preventDefault();
-            applyLayerCount();
-            layersInput.blur();
-        }
-    });
-    layers.append(layersLabel, layersInput);
+    const layersValue = document.createElement('b');
+    layersValue.textContent = formatNumber(info.layer_count ?? 1);
+    layers.title = '在右侧“模型设置”中修改总层数。';
+    layers.append(layersLabel, layersValue);
     dom.modelInfo.appendChild(layers);
     const structure = info.structure;
     if (structure) {
@@ -286,27 +266,20 @@ function renderModelInfo(info) {
 
 /**
  * 流程图 + 左侧栏 → 完整 config。
- * 以当前完整 config 为底座，仅用左侧栏产出的四段覆盖，
- * 这样 schema_version、model.dtype/quantization 等界面未暴露的段不会丢失。
+ * 模型完全由流程图序列化；左侧栏只提供运行环境和请求参数。
  */
 async function buildConfig() {
-    const base = { ...(AppState.baseConfig ?? {}), ...getSidebarConfig() };
-    syncFlowchartModelInfo(base.model);
+    const sidebar = getSidebarConfig();
+    // The flowchart is authoritative for model edits. Reusing sidebar.model here
+    // would overwrite a just-edited cycle count before serialization.
+    const base = {
+        ...(AppState.baseConfig ?? {}),
+        ...sidebar,
+        model: AppState.baseConfig?.model,
+    };
     const config = await flowchartToConfig(AppState.flowchart, base);
     AppState.baseConfig = config;
     return config;
-}
-
-function syncFlowchartModelInfo(model) {
-    const info = AppState.flowchart?.model_info;
-    if (!info || !model || typeof model !== 'object') return;
-    const dimensions = model.dimensions ?? {};
-    for (const key of ['layer_count', 'hidden_size', 'intermediate_size', 'vocab_size', 'padded_vocab_size']) {
-        if (dimensions[key] != null) info[key] = Number(dimensions[key]);
-    }
-    if (model.name) info.name = String(model.name);
-    if (model.id) info.model_id = String(model.id);
-    if (model.dtype && typeof model.dtype === 'object') info.dtype = { ...model.dtype };
 }
 
 /** 「计算」按钮：组装 config → 估算 → 渲染结果 */
@@ -411,6 +384,10 @@ function bindToolbar() {
         if (id) loadPreset(id).catch((error) => reportError(error, '预设加载失败'));
     });
     dom.btnCompute.addEventListener('click', compute);
+    dom.btnModelSettings.addEventListener('click', () => {
+        AppState.selectedNode = null;
+        renderModelSettings();
+    });
     dom.btnExport.addEventListener('click', exportConfig);
     dom.btnImport.addEventListener('click', () => dom.fileImport.click());
     dom.fileImport.addEventListener('change', () => {
@@ -522,20 +499,6 @@ function bindBus() {
         markStale(true);
     });
     Bus.on(EVENTS.CONFIG_CHANGED, ({ path } = {}) => {
-        if (String(path ?? '').startsWith('model.')) {
-            const model = getSidebarConfig().model;
-            if (path === 'model.dimensions.layer_count') {
-                const accepted = setModelLayerCount(model?.dimensions?.layer_count);
-                if (!accepted && AppState.flowchart?.model_info) {
-                    AppState.sidebarConfig.model.dimensions.layer_count = AppState.flowchart.model_info.layer_count;
-                    loadFromConfig(getSidebarConfig());
-                }
-            } else {
-                syncFlowchartModelInfo(model);
-                downgradeOfficialMapping();
-            }
-            renderModelInfo(AppState.flowchart?.model_info);
-        }
         markStale(true);
     });
     Bus.on(EVENTS.VIEW_CHANGED, ({ scale }) => {

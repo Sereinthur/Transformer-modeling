@@ -66,6 +66,21 @@ class DeepSeekV4Tests(unittest.TestCase):
             return sum(item["capacity"]["temporary_bytes"] for item in phase_operators(result["performance"]["prefill"]) if item["type"] == "mhc")
         self.assertAlmostEqual(temporary(8) / temporary(4), 2.0, places=6)
 
+    def test_zero_sinkhorn_iterations_add_no_sinkhorn_work(self):
+        data = v4_data("pro", tp=1, ep=1)
+        for operator in mutable_ops(data["model"], "mhc"):
+            operator["sinkhorn_iters"] = 0
+        result = estimate(Config.from_dict(data), True)
+        mhc = next(item for item in phase_operators(result["performance"]["prefill"])
+                   if item["type"] == "mhc")
+        default = estimate(Config.from_dict(v4_data("pro", tp=1, ep=1)), True)
+        default_mhc = next(item for item in phase_operators(default["performance"]["prefill"])
+                           if item["type"] == "mhc")
+        self.assertLess(
+            mhc["suboperators"][0]["ops"]["executed"],
+            default_mhc["suboperators"][0]["ops"]["executed"],
+        )
+
     def test_operator_replacement_and_validation(self):
         data = v4_data("flash")
         mutable_ops(data["model"], "sliding_window_attention")[0]["sliding_window"] = 0

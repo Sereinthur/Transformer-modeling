@@ -95,10 +95,7 @@ class ExecutionSpec:
     kv_paged: bool                          # KV Cache 是否分页管理
     kv_page_tokens: int                     # KV Cache 每页的 token 数
 
-    # ── 5. 推理模式 ─────────────────────────────────────────────────────
-    prefill_logits_mode: str                # Prefill logits 模式：last_token / all_prompt_tokens
-
-    # ── 6. 可选：GEMM 形状感知效率表 ─────────────────────────────────────
+    # ── 5. 可选：GEMM 形状感知效率表 ─────────────────────────────────────
     #   [[rows, efficiency], ...]，按 GEMM 的 M 维在 log2 域插值；
     #   配置后对 gemm 类算子覆盖 Prefill/Decode 常数效率，未配置时回退常数。
     gemm_efficiency_by_rows: tuple[tuple[int, float], ...] | None = None
@@ -110,7 +107,6 @@ class ExecutionSpec:
         overlap = data.get("overlap", {})
         fusion = data.get("fusion", {})
         memory = data.get("memory", {})
-        inference = model_data.get("inference", {})
 
         rows_table = efficiencies.get("gemm_by_rows")
         parsed_table: tuple[tuple[int, float], ...] | None = None
@@ -164,9 +160,7 @@ class ExecutionSpec:
             # 4. KV 内存
             kv_paged=bool(memory.get("kv_paged", True)),
             kv_page_tokens=int(memory.get("kv_page_tokens", 16)),
-            # 5. 推理模式
-            prefill_logits_mode=str(inference.get("prefill_logits_mode", "last_token")),
-            # 6. 可选形状感知效率表
+            # 5. 可选形状感知效率表
             gemm_efficiency_by_rows=parsed_table,
         )
 
@@ -192,11 +186,7 @@ class ExecutionSpec:
             if not 0 <= value <= 1:
                 raise ValueError(f"execution.overlap.{name} must be in [0, 1]")
 
-        # ── 校验：推理模式与 KV 分页 ─────────────────────────────────────
-        if spec.prefill_logits_mode not in {"last_token", "all_prompt_tokens"}:
-            raise ValueError(
-                "model.inference.prefill_logits_mode must be last_token or all_prompt_tokens"
-            )
+        # ── 校验：KV 分页 ────────────────────────────────────────────────
         if spec.kv_paged:
             _positive("execution.memory.kv_page_tokens", spec.kv_page_tokens)
         return spec

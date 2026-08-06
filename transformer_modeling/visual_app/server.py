@@ -15,6 +15,7 @@ from typing import Any, Callable
 from urllib.parse import unquote, urlparse
 
 from transformer_modeling import Config, estimate  # noqa: E402 - 需先补全sys.path
+from transformer_modeling.config import expand_preset_config  # noqa: E402
 from transformer_modeling.models import (  # noqa: E402
     preset_catalog,
     resolve_model_definition,
@@ -195,7 +196,7 @@ class FlowchartHandler(BaseHTTPRequestHandler):
     def _config_to_flowchart(self, body: dict[str, Any]) -> dict[str, Any]:
         # 允许直接提交完整config，或包在 {"config": {...}} 里。
         config = body.get("config", body)
-        return config_to_flowchart(_require_dict(config, "config"))
+        return config_to_flowchart(expand_preset_config(_require_dict(config, "config")))
 
     def _flowchart_to_config(self, body: dict[str, Any]) -> dict[str, Any]:
         flowchart = _require_dict(body.get("flowchart"), "flowchart")

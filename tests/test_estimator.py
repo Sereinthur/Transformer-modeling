@@ -36,6 +36,19 @@ class EstimatorTests(unittest.TestCase):
         interval = result["performance"]["decode"]["device_inter_token_interval"]
         self.assertGreater(interval["last_seconds"], interval["first_seconds"])
 
+    def test_flash_attention_does_not_change_attention_flop_count(self):
+        flash = estimate(Config.from_dict(example()), True)
+        unfused = example()
+        unfused["execution"]["fusion"]["flash_attention"] = False
+        standard = estimate(Config.from_dict(unfused), True)
+
+        def attention_ops(result):
+            attention = next(item for item in phase_operators(result["performance"]["prefill"])
+                             if item["type"] == "standard_attention")
+            return next(item for item in attention["suboperators"] if item["name"] == "layers.attention")["ops"]["executed"]
+
+        self.assertEqual(attention_ops(flash), attention_ops(standard))
+
     def test_single_request_decode_throughput_uses_step_latency(self):
         from helpers import parallel
 
@@ -61,6 +74,10 @@ class EstimatorTests(unittest.TestCase):
         self.assertFalse(result["capacity"]["capacity_feasible"])
         self.assertTrue(result["capacity"]["performance_is_theoretical"])
         self.assertIsNotNone(result["performance"])
+        self.assertEqual(
+            result["warnings"],
+            ["关键rank容量不足；性能结果是假设权重与状态可驻留时的理论值。"],
+        )
 
     def test_unmodeled_parameters_are_capacity_only(self):
         data = example()

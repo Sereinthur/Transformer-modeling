@@ -15,7 +15,17 @@ def _hf_definition(config: dict[str, Any]) -> dict[str, Any]:
     h = int(config["hidden_size"])
     qh = int(config["num_attention_heads"])
     kvh = int(config.get("num_key_value_heads", qh))
+    if qh <= 0:
+        raise ValueError("Hugging Face config num_attention_heads must be greater than zero")
+    if kvh <= 0 or kvh > qh:
+        raise ValueError("Hugging Face config num_key_value_heads must be in [1, num_attention_heads]")
+    if "head_dim" not in config and h % qh:
+        raise ValueError(
+            "Hugging Face config hidden_size must be divisible by num_attention_heads when head_dim is absent"
+        )
     dim = int(config.get("head_dim", h // qh))
+    if dim <= 0:
+        raise ValueError("Hugging Face config head_dim must be greater than zero")
     model_type = str(config.get("model_type", "unknown"))
     unsupported = []
     if config.get("num_local_experts"):
@@ -53,11 +63,13 @@ def _hf_definition(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def resolve_model_definition(*, preset_id: str | None = None,
-                             hf_config: dict[str, Any] | None = None,
-                             scenario: str = "base") -> dict[str, Any]:
+                              hf_config: dict[str, Any] | None = None,
+                              scenario: str = "base") -> dict[str, Any]:
     if (preset_id is None) == (hf_config is None):
         raise ValueError("preset_id和hf_config必须且只能提供一个")
     if preset_id is not None:
+        if scenario != "base":
+            raise ValueError("only scenario='base' is currently supported")
         preset = get_preset(preset_id, scenario)
         return {"resolved_model": preset["model"], "default_max_sequence_length": preset["default_max_sequence_length"], "warnings": preset["model"].get("metadata", {}).get("unsupported_features", [])}
     assert hf_config is not None

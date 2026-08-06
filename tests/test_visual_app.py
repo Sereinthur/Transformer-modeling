@@ -43,7 +43,9 @@ class VisualAppTests(unittest.TestCase):
         with urlopen(f"{self.base_url}/", timeout=3) as response:
             page = response.read().decode("utf-8")
         self.assertIn('id="sidebar-tabs"', page)
-        self.assertIn('data-tab="model"', page)
+        self.assertNotIn('data-tab="model"', page)
+        self.assertIn('id="btn-model-settings"', page)
+        self.assertEqual(page.count('data-tab="hardware"'), 1)
         self.assertIn('js/app.js', page)
         schemas = self.get_json("/api/operator-schemas")
         self.assertEqual(schemas["schema_version"], 3)
@@ -66,6 +68,26 @@ class VisualAppTests(unittest.TestCase):
         })["config"]
         self.assertEqual(rebuilt["model"]["dimensions"]["hidden_size"], 5120)
         self.assertEqual(rebuilt["model"]["dimensions"]["intermediate_size"], 16384)
+
+    def test_flowchart_layer_count_reaches_estimator(self):
+        resolved = self.post_json("/api/resolve-preset", {"preset_id": "minimax-m3"})
+        config = resolved["config"]
+        flowchart = self.post_json("/api/config-to-flowchart", {"config": config})
+        self.assertGreater(flowchart["model_info"]["structure"]["full_cycle_count"], 0)
+
+        flowchart["model_info"]["layer_count"] = 300
+        rebuilt = self.post_json("/api/flowchart-to-config", {
+            "flowchart": flowchart, "base_config": config,
+        })["config"]
+        self.assertEqual(rebuilt["model"]["dimensions"]["layer_count"], 300)
+
+        baseline = self.post_json("/api/estimate", {"config": config})
+        changed = self.post_json("/api/estimate", {"config": rebuilt})
+        self.assertGreater(changed["model"]["parameters"], baseline["model"]["parameters"] * 5)
+        self.assertGreater(
+            changed["performance"]["prefill"]["latency_seconds"],
+            baseline["performance"]["prefill"]["latency_seconds"] * 5,
+        )
 
     def test_old_api_and_schema_are_not_available(self):
         for route in ("/api/local-devices", "/api/model-definitions/resolve"):

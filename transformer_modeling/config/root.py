@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,6 +12,27 @@ from .execution import ExecutionSpec, ParallelSpec
 from .hardware import HardwareSpec
 from .model import ModelSpec
 from .serving import ServingSpec
+
+
+def expand_preset_config(data: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a scenario's preset_id into a standalone Schema v3 model."""
+
+    if not isinstance(data, dict):
+        raise ValueError("configuration must be an object")
+    expanded = deepcopy(data)
+    preset_id = expanded.get("preset_id")
+    if preset_id is None:
+        return expanded
+    if not isinstance(preset_id, str) or not preset_id:
+        raise ValueError("preset_id must be a non-empty string")
+    if "model" in expanded:
+        raise ValueError("configuration must provide either preset_id or model, not both")
+    from ..models import resolve_model_definition
+
+    resolved = resolve_model_definition(preset_id=preset_id)
+    expanded["model"] = resolved["resolved_model"]
+    expanded.pop("preset_id")
+    return expanded
 
 
 @dataclass(frozen=True)
@@ -25,8 +47,7 @@ class Config:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Config":
-        if not isinstance(data, dict):
-            raise ValueError("configuration must be an object")
+        data = expand_preset_config(data)
         version = int(data.get("schema_version", 0))
         if version != 3:
             if version in {1, 2}:

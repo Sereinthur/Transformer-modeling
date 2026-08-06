@@ -2,26 +2,12 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import Any
 
 from ..communication import collective_profile
 from ..core import OperatorCostModel
 from ..operators import OperatorContext, OperatorEstimate, get_operator
 from ..parallel.pipeline.schedule import pipeline_schedule
-
-
-def _group_layer_operators(layers) -> list[tuple[object, int]]:
-    """相同配置的算子聚合，避免结果中重复数千个节点。"""
-
-    grouped: dict[tuple[str, str, str], list[object | int]] = {}
-    for layer in layers:
-        for spec in layer.main_operators:
-            key = spec.signature()
-            if key not in grouped:
-                grouped[key] = [spec, 0]
-            grouped[key][1] = int(grouped[key][1]) + 1
-    return [(value[0], int(value[1])) for value in grouped.values()]
 
 
 def build_estimates(config, layers, phase: str, batch_size: int,
@@ -150,6 +136,7 @@ def _layer_weights(config, layers) -> list[float]:
     """用当前请求的Prefill+全部Decode近似成本平衡异构层。"""
 
     weights = []
+    micro_batch = config.serving.batch_size // config.parallelism.pipeline_microbatches
     # 相同签名的层成本一致，只估算一次。
     cache: dict[tuple, float] = {}
     for layer_index, layer in enumerate(layers):
@@ -159,11 +146,11 @@ def _layer_weights(config, layers) -> list[float]:
         )
         if key not in cache:
             prefill = summarize_stage(
-                config, [layer], "prefill", config.serving.batch_size, config.serving.prompt_length,
+                config, [layer], "prefill", micro_batch, config.serving.prompt_length,
                 config.serving.prompt_length, False, False, False, layer_index,
             )["latency_seconds"]
             decode = summarize_stage(
-                config, [layer], "decode", config.serving.batch_size, 1,
+                config, [layer], "decode", micro_batch, 1,
                 config.serving.prompt_length, False, False, False, layer_index,
             )["latency_seconds"]
             cache[key] = prefill + max(0, config.serving.output_length - 1) * decode
@@ -216,8 +203,8 @@ def summarize_parallel_phase(config, phase: str, attention_length: int,
         stages = balanced_layer_partition(config, config.model.expanded_layers())
     microbatches = config.parallelism.pipeline_microbatches
     micro_batch = config.serving.batch_size // microbatches
-    active_ep = min(config.parallelism.expert_parallel, micro_batch)
     token_length = config.serving.prompt_length if phase == "prefill" else 1
+    active_ep = min(config.parallelism.expert_parallel, micro_batch * token_length)
     stage_results = []
     layer_start = 0
     for index, stage_layers in enumerate(stages):

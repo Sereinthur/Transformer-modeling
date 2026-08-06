@@ -10,6 +10,7 @@ from .compressed_attention import CSAOperator, HCAOperator
 from .dsa import DSAAttentionOperator
 from .ffn import DenseFFNOperator, GatedFFNOperator, MoEOperator
 from .mla import GatedMLAOperator
+from .msa import MiniMaxSparseAttentionOperator
 from .standard import (
     AttnResOperator, LayerNormOperator, LMHeadOperator, MHCOperator,
     RMSNormOperator, SamplingOperator, StandardResidualOperator,
@@ -31,7 +32,7 @@ for _operator in (
     TokenEmbeddingOperator(), RMSNormOperator(), LayerNormOperator(),
     StandardResidualOperator(), AttnResOperator(), MHCOperator(),
     StandardAttentionOperator(), SlidingWindowAttentionOperator(),
-    KDAOperator(), GatedMLAOperator(), DSAAttentionOperator(),
+    KDAOperator(), GatedMLAOperator(), DSAAttentionOperator(), MiniMaxSparseAttentionOperator(),
     CSAOperator(), HCAOperator(), DenseFFNOperator(), GatedFFNOperator(),
     MoEOperator(), LMHeadOperator(), SamplingOperator(), UnmodeledOperator(),
 ):

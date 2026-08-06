@@ -247,13 +247,21 @@ p { margin: 0; }
     position: relative;
     display: flex;
     flex-direction: column;
+    height: 100%;
     min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
     background: linear-gradient(180deg, var(--panel), #1b1b30);
     border-right: 1px solid var(--line);
 }
 
 .panel-head {
     flex: 0 0 40px;
+    position: sticky;
+    top: 0;
+    z-index: 2;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -263,9 +271,10 @@ p { margin: 0; }
 }
 
 .sidebar-body {
-    flex: 1 1 auto;
-    min-height: 0;
-    overflow-y: auto;
+    flex: 0 0 auto;
+    min-height: auto;
+    height: auto;
+    overflow: visible;
     padding: 12px 12px 24px;
     display: flex;
     flex-direction: column;
@@ -296,8 +305,11 @@ p { margin: 0; }
 /* Tab 切换 */
 .tabs {
     flex: 0 0 auto;
+    position: sticky;
+    top: 40px;
+    z-index: 2;
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(5, 1fr);
     border-bottom: 1px solid var(--line);
     background: rgba(0, 0, 0, .18);
 }
@@ -630,7 +642,7 @@ p { margin: 0; }
     border: 1px solid var(--line);
     border-radius: var(--radius);
     background: linear-gradient(135deg, rgba(255, 255, 255, .05), transparent 65%), rgba(0, 0, 0, .2);
-    overflow: hidden;
+    overflow: visible;
 }
 .node-head::before {
     content: '';
@@ -647,13 +659,23 @@ p { margin: 0; }
 .node-head.cat-output::before { background: var(--c-output); }
 .node-head.cat-layer::before { background: var(--c-layer); }
 
-.node-title h3 { font-size: 16px; letter-spacing: .03em; }
+.node-title {
+    min-width: 0;
+}
+.node-title h3 {
+    font-size: 16px;
+    letter-spacing: .03em;
+    overflow-wrap: anywhere;
+}
 .node-title code {
     display: inline-block;
     margin-top: 5px;
     font-size: 10.5px;
     color: var(--text-mute);
     letter-spacing: .04em;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    white-space: normal;
 }
 
 .btn-swap { margin-top: 11px; width: 100%; }

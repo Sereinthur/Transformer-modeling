@@ -8,6 +8,7 @@ from typing import Any
 
 _K3_TARGET = 2_780_000_000_000
 _GLM52_TARGET = 744_000_000_000
+_MINIMAX_M3_TARGET = 428_000_000_000
 _V4_VARIANTS = {
     "pro": {"layers": 61, "hidden": 7168, "query_heads": 128, "head_dim": 512, "q_lora_rank": 1536, "o_lora_rank": 1024, "o_groups": 16, "experts": 384, "expert_width": 3072, "selected_entries": 1024, "route_scale": 2.5, "parameter_reference": 1_600_000_000_000},
     "flash": {"layers": 43, "hidden": 4096, "query_heads": 64, "head_dim": 512, "q_lora_rank": 1024, "o_lora_rank": 1024, "o_groups": 8, "experts": 256, "expert_width": 2048, "selected_entries": 512, "route_scale": 1.5, "parameter_reference": 284_000_000_000},
@@ -157,6 +158,53 @@ def glm_5_2_definition() -> tuple[dict[str, Any], int]:
     return model, 1_048_576
 
 
+def minimax_m3_definition() -> tuple[dict[str, Any], int]:
+    """Official MiniMax-M3 text backbone: 3 Full/Dense layers then 57 MSA/MoE layers."""
+    model = _base_model("minimax-m3", "MiniMax-M3", 60, 6144, 12288, 200064, "bf16")
+    full_attention = {
+        "type": "standard_attention", "implementation": "flash_attention", "query_heads": 64,
+        "kv_heads": 4, "head_dim": 128, "query_width_equals_hidden": False,
+        "kv_cache_dtype": "bf16",
+    }
+    msa = {
+        "type": "minimax_sparse_attention", "implementation": "block_sparse", "query_heads": 64,
+        "kv_heads": 4, "head_dim": 128, "indexer_heads": 4, "indexer_head_dim": 128,
+        "block_size": 128, "topk_blocks": 16, "rope_dim": 64, "kv_cache_dtype": "bf16",
+    }
+    dense = {
+        "type": "gated_ffn", "implementation": "swiglu", "intermediate_size": 12288,
+    }
+    moe = {
+        "type": "moe", "implementation": "standard_moe", "expert_count": 128,
+        "experts_per_token": 4, "expert_intermediate_size": 3072,
+        "shared_expert_count": 1, "shared_expert_intermediate_size": 3072,
+        "activation": "swiglu", "gate_activation": "sigmoid", "routing": "learned",
+        "swiglu_limit": 7.0, "routed_scaling_factor": 2.0,
+    }
+    model.update({
+        "embedding": {"type": "token_embedding", "tied_lm_head": False},
+        "layer_prefix": [_transformer_layer(3, full_attention, dense)],
+        "layer_pattern": [_transformer_layer(1, msa, moe)],
+        "output": _output(),
+        "metadata": {
+            "family": "MiniMax-M3 MSA MoE", "mapping_quality": "official_config_aligned",
+            "structure_accuracy": "official_text_backbone_exact",
+            "performance_formula_confidence": "mixed_medium",
+            "published_parameter_reference": _MINIMAX_M3_TARGET,
+            "config_source": "MiniMaxAI/MiniMax-M3 config.json",
+            "peripheral_modules": [
+                {"name": "CLIP ViT-32L + multimodal projector", "status": "shown_not_estimated"},
+                {"name": "MTP modules ×7", "status": "shown_not_estimated"},
+            ],
+            "unsupported_features": [
+                "Vision tower/projector and 7-MTP speculative decoding are not included in the text-backbone performance estimate.",
+                "Gemma-style RMSNorm, per-head QK norm, partial RoPE and router correction bias preserve architecture semantics but do not change the current proxy formula.",
+            ],
+        },
+    })
+    return model, 1_048_576
+
+
 def preset_catalog() -> dict[str, Any]:
     presets = []
     model, context = moe_definition()
@@ -168,10 +216,14 @@ def preset_catalog() -> dict[str, Any]:
         presets.append({"id": model["id"], "name": model["name"], "family": "DeepSeek-V4", "mapping_quality": model["metadata"]["mapping_quality"], "unsupported_features": model["metadata"]["unsupported_features"], "model": model, "default_max_sequence_length": context})
     glm, context = glm_5_2_definition()
     presets.append({"id": glm["id"], "name": glm["name"], "family": "GLM-5.2 DSA MoE", "mapping_quality": glm["metadata"]["mapping_quality"], "unsupported_features": glm["metadata"]["unsupported_features"], "model": glm, "default_max_sequence_length": context})
+    minimax, context = minimax_m3_definition()
+    presets.append({"id": minimax["id"], "name": minimax["name"], "family": "MiniMax-M3 MSA MoE", "mapping_quality": minimax["metadata"]["mapping_quality"], "unsupported_features": minimax["metadata"]["unsupported_features"], "model": minimax, "default_max_sequence_length": context})
     return {"schema_version": 3, "snapshot_date": "2026-08-04", "presets": presets}
 
 
 def get_preset(preset_id: str, scenario: str = "base") -> dict[str, Any]:
+    if scenario != "base":
+        raise ValueError("only scenario='base' is currently supported")
     if preset_id == "kimi-k3-draft":
         raise ValueError("preset kimi-k3-draft has been removed; use kimi-k3-official")
     for item in preset_catalog()["presets"]:
