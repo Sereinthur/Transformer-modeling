@@ -6,7 +6,8 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from transformer_modeling.visual_app.server import FlowchartHandler
+from transformer_modeling.visual_app.desktop import WINDOW_TITLE, build_parser as desktop_parser
+from transformer_modeling.visual_app.server import FlowchartHandler, start_local_server
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +78,18 @@ class VisualAppTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as caught:
             self.post_json("/api/estimate", expired)
         caught.exception.close()
+
+    def test_desktop_shell_uses_an_ephemeral_local_server(self):
+        self.assertEqual(desktop_parser().parse_args([]).debug, False)
+        self.assertEqual(WINDOW_TITLE, "Transformer Modeling")
+        server, url = start_local_server()
+        try:
+            self.assertTrue(url.startswith("http://127.0.0.1:"))
+            with urlopen(url, timeout=3) as response:
+                self.assertEqual(response.status, 200)
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

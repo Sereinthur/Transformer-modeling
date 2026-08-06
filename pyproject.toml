@@ -12,6 +12,10 @@ license = {text = "MIT"}
 authors = [{name = "Transformer Modeling Project"}]
 dependencies = []
 
+[project.optional-dependencies]
+desktop = ["pywebview>=5.4"]
+desktop-build = ["pywebview>=5.4", "pyinstaller>=6.0"]
+
 [project.scripts]
 transformer-model = "transformer_modeling.cli:main"
 transformer-model-visual = "transformer_modeling.visual_app.server:main"

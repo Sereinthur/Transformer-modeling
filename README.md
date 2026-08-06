@@ -29,23 +29,37 @@ layer operators: Norm | Attention | MoE | Residual | AttnRes | mHC
 
 暂不包含 CP、DP 模型并行、CPU/NVMe Offload、热点专家、网络拥塞、离散事件调度、服务排队和尾延迟。
 
-## 启动网页
+## 桌面应用
 
-Python 3.10 及以上，无第三方依赖：
+桌面建模器使用系统 WebView2 渲染为独立窗口，不会打开浏览器。仅保留以下两种启动方式；
+均需要 Python 3.10 以上，首次安装依赖时需要网络。
 
+**终端启动**
 ```powershell
 git clone https://github.com/Sereinthur/Transformer-modeling.git
 cd Transformer-modeling
-python -m transformer_modeling.visual_app
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -e .[desktop]
+.venv\Scripts\python.exe -m transformer_modeling.visual_app.desktop
 ```
 
-也可以双击 `启动可视化.bat`。默认地址为 `http://127.0.0.1:8001`；不自动打开浏览器时：
+**快捷启动**
+
+Windows 用户双击 `start_visual_app.bat`。首次运行会创建项目内 `.venv` 并自动安装依赖；
+之后直接打开桌面窗口。本地 HTTP 服务只用于应用内部通信。
+
+模型页包含 Prefix、循环 Pattern 与 Suffix 的有序算子编辑器。每个层段可设置重复次数；每个算子均可插入、删除、移动、替换并独立编辑参数。KDA、MLA、AttnRes、mHC、MoE 与 MXFP 参数不依赖具体模型预设。
+
+开发者可将程序打包为 Windows 可执行文件：
 
 ```powershell
-python -m transformer_modeling.visual_app --no-browser
+pip install -e .[desktop-build]
+python scripts/build_desktop.py
 ```
 
-模型页包含 Prefix、循环 Pattern 与 Suffix 的有序算子编辑器。每个层段可设置重复次数；每个算子均可插入、删除、移动、替换并独立编辑参数。KDA、MLA、AttnRes、mHC、MoE 与 MXFP 参数不依赖具体模型预设。停止服务可双击 `停止可视化.bat`，脚本只会终止监听 8001 且命令行属于 `transformer_modeling.visual_app` 的 Python 进程。
+输出为 `dist/TransformerModeling/TransformerModeling.exe`，其中包含界面静态资源和示例配置。
+将整个 `dist/TransformerModeling/` 目录发给其他 Windows 用户即可运行，无需预装 Python；
+系统需要 Microsoft Edge WebView2 Runtime（Windows 11 通常已内置）。
 
 示例中的效率系数是依据公开评测资料约束校准的保守经验初值。公开资料提供的是端到端吞吐、TTFT、TPOT和容量分解，不能唯一反解单个算子的效率，因此这些数值不是实测真值：Dense示例使用`0.65/0.20`的Prefill/Decode GEMM效率、`0.50/0.15`的Attention效率、`0.15`的向量效率和`0.75`的HBM效率；MoE与KDA/MLA示例使用更保守的初值。用户应按硬件、框架、精度和Shape继续调整。
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import sys
 import threading
 import webbrowser
 from http import HTTPStatus
@@ -24,7 +25,8 @@ from .flowchart_schema import config_to_flowchart, flowchart_to_config
 from .operator_schemas import schema_payload
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
-PROJECT_ROOT = PACKAGE_ROOT.parents[1]
+# PyInstaller extracts bundled resources into _MEIPASS rather than the source tree.
+PROJECT_ROOT = Path(getattr(sys, "_MEIPASS", PACKAGE_ROOT.parents[1]))
 STATIC_ROOT = PACKAGE_ROOT / "static"
 EXAMPLE_CONFIG = PROJECT_ROOT / "examples" / "single_chip_gqa.json"
 MAX_REQUEST_BYTES = 4_000_000
@@ -241,6 +243,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8001, help="监听端口，默认 8001")
     parser.add_argument("--no-browser", action="store_true", help="启动时不自动打开浏览器")
     return parser
+
+
+def start_local_server(host: str = "127.0.0.1", port: int = 0) -> tuple[ThreadingHTTPServer, str]:
+    """Start the visual API in a daemon thread and return its local URL."""
+
+    server = ThreadingHTTPServer((host, port), FlowchartHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    return server, f"http://{display_host}:{server.server_port}"
 
 
 def main(argv: list[str] | None = None) -> int:
